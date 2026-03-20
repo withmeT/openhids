@@ -1,0 +1,36 @@
+{"ts_ms": 1773977144651, "uid": 0, "tgid": 2009172, "pid": 2009172, "comm": "bash", "line": "python3.11 receiver.py "}
+{"ts_ms": 1773977169588, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "pwd"}
+{"ts_ms": 1773977176162, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ip addr"}
+{"ts_ms": 1773977176162, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/os-release"}
+{"ts_ms": 1773977176162, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/passwd"}
+{"ts_ms": 1773977176162, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/shadow"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/login.defs"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/profile"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/pam.d/system-auth"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/pam.d/common-auth"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/pam.d/common-password"}
+{"ts_ms": 1773977176263, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/pam.d/sshd"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/security/pwquality.conf"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/ssh/sshd_config"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/sudoers"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/group"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "getenforce"}
+{"ts_ms": 1773977176364, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ps aux"}
+{"ts_ms": 1773977176465, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/audit/auditd.conf"}
+{"ts_ms": 1773977176465, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/rsyslog.conf"}
+{"ts_ms": 1773977176465, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "head -n 3 /var/log/messages"}
+{"ts_ms": 1773977176465, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/hosts.allow"}
+{"ts_ms": 1773977176465, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/hosts.deny"}
+{"ts_ms": 1773977176566, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "iptables -L"}
+{"ts_ms": 1773977176566, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ss -lntu"}
+{"ts_ms": 1773977177578, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "cat /etc/exports"}
+{"ts_ms": 1773977204504, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "sh"}
+{"ts_ms": 1773977208246, "uid": 0, "tgid": 2020922, "pid": 2020922, "comm": "sh", "line": "111"}
+{"ts_ms": 1773977209461, "uid": 0, "tgid": 2020922, "pid": 2020922, "comm": "sh", "line": "222"}
+{"ts_ms": 1773977210877, "uid": 0, "tgid": 2020922, "pid": 2020922, "comm": "sh", "line": "333"}
+{"ts_ms": 1773977214720, "uid": 0, "tgid": 2020922, "pid": 2020922, "comm": "sh", "line": "exit"}
+{"ts_ms": 1773977423132, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ls -lh target/release/hids"}
+{"ts_ms": 1773979029423, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "lslsls"}
+{"ts_ms": 1773979030940, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ls"}
+{"ts_ms": 1773979031752, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ls"}
+{"ts_ms": 1773979251504, "uid": 0, "tgid": 2018563, "pid": 2018563, "comm": "bash", "line": "ls -lh target/release/hids"}

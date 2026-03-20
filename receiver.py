@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "hids-receiver/0.1"
+    spool_file = "received.jsonl"
 
     def _send(self, code: int, body: dict):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -36,9 +37,29 @@ class Handler(BaseHTTPRequestHandler):
             f"[{time.strftime('%F %T')}] received batches=1 items={len(items)} bytes={len(raw)}",
             flush=True,
         )
+
+        # Persist every item so we don't "lose logs" at the receiver.
+        # If we can't write, we should fail the request so the agent retries via spool.
+        try:
+            if items:
+                with open(self.spool_file, "a", encoding="utf-8") as f:
+                    for it in items:
+                        f.write(json.dumps(it, ensure_ascii=False) + "\n")
+                    f.flush()
+            else:
+                # still treat empty batch as success
+                pass
+        except Exception as e:
+            self._send(500, {"ok": False, "error": f"failed to write {self.spool_file}: {e}"})
+            return
+
         if items:
-            # 打印第一条方便你确认字段
-            print(f"  first={items[0]}", flush=True)
+            # Print first + last to reduce console spam while still confirming data isn't empty.
+            if len(items) == 1:
+                print(f"  first={items[0]}", flush=True)
+            else:
+                print(f"  first={items[0]}", flush=True)
+                print(f"  last={items[-1]}", flush=True)
 
         self._send(200, {"ok": True, "received": len(items), "ts": now})
 
