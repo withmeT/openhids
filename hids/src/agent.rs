@@ -6,7 +6,8 @@ use std::{
 use anyhow::Context as _;
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::RingBuf;
-use aya::programs::UProbe;
+use aya::maps::HashMap as AyaHashMap;
+use aya::programs::{UProbe, Xdp, XdpFlags};
 
 use crate::{
     batcher::Batcher,
@@ -17,7 +18,114 @@ use crate::{
     utils::cstr_from_fixed,
 };
 
-use hids_common::CommandEvent;
+use hids_common::{CommandEvent, FlowEvent};
+
+fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
+    let mut it = s.split('.');
+    let a: u32 = it.next()?.trim().parse().ok()?;
+    let b: u32 = it.next()?.trim().parse().ok()?;
+    let c: u32 = it.next()?.trim().parse().ok()?;
+    let d: u32 = it.next()?.trim().parse().ok()?;
+    if [a, b, c, d].iter().any(|x| *x > 255) {
+        return None;
+    }
+    Some((a << 24) | (b << 16) | (c << 8) | d)
+}
+
+fn be_u32_to_ipv4_str(ip_be: u32) -> String {
+    let a = (ip_be >> 24) & 0xff;
+    let b = (ip_be >> 16) & 0xff;
+    let c = (ip_be >> 8) & 0xff;
+    let d = ip_be & 0xff;
+    format!("{a}.{b}.{c}.{d}")
+}
+
+fn detect_local_ipv4s() -> Vec<String> {
+    // best-effort: hostname -I is common on linux.
+    let out = std::process::Command::new("hostname")
+        .arg("-I")
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.split_whitespace()
+        .filter_map(|tok| ipv4_str_to_be_u32(tok).map(|_| tok.to_string()))
+        .collect()
+}
+
+fn parse_dev_from_ip_route(s: &str) -> Option<String> {
+    // Example:
+    // default via 192.168.1.1 dev eth0 proto dhcp metric 100
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    for i in 0..toks.len().saturating_sub(1) {
+        if toks[i] == "dev" {
+            return Some(toks[i + 1].to_string());
+        }
+    }
+    None
+}
+
+fn detect_external_iface() -> Option<String> {
+    // Prefer the default route's interface (best-effort).
+    let out = std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(dev) = parse_dev_from_ip_route(&s) {
+                return Some(dev);
+            }
+        }
+    }
+
+    // Another common fallback.
+    let out = std::process::Command::new("ip")
+        .args(["route", "get", "1.1.1.1"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(dev) = parse_dev_from_ip_route(&s) {
+                return Some(dev);
+            }
+        }
+    }
+
+    // Last fallback: first "up" non-loopback interface.
+    let out = std::process::Command::new("ip")
+        .args(["-o", "link", "show", "up"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines() {
+                // Example: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ..."
+                if let Some((_, rest)) = line.split_once(':') {
+                    let rest = rest.trim_start();
+                    let ifname = rest.split(':').next().unwrap_or("").trim();
+                    if ifname.is_empty() {
+                        continue;
+                    }
+                    if ifname == "lo" {
+                        continue;
+                    }
+                    if ifname.starts_with("docker")
+                        || ifname.starts_with("br-")
+                        || ifname.starts_with("veth")
+                        || ifname.starts_with("virbr")
+                    {
+                        continue;
+                    }
+                    return Some(ifname.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
 
 async fn send_envelope(
     client: &reqwest::Client,
@@ -74,6 +182,56 @@ pub async fn run() -> Result<(), anyhow::Error> {
         .take_map("EVENTS")
         .context("map EVENTS not found")?;
     let mut ringbuf_cmd = RingBuf::try_from(events_map)?;
+
+    // XDP flow collection (five tuple)
+    let mut ringbuf_flow = None;
+    if cfg.xdp_enabled {
+        // 1) configure skip map (local + configured ips)
+        let mut skip_map = AyaHashMap::<_, u32, u8>::try_from(
+            bpf.map_mut("SKIP_IPS").context("map SKIP_IPS not found")?,
+        )?;
+
+        // always skip loopback
+        if let Some(ip) = ipv4_str_to_be_u32("127.0.0.1") {
+            let _ = skip_map.insert(ip, 1, 0);
+        }
+        for ip in detect_local_ipv4s() {
+            if let Some(ip_be) = ipv4_str_to_be_u32(&ip) {
+                let _ = skip_map.insert(ip_be, 1, 0);
+            }
+        }
+        for ip in &cfg.xdp_skip_ips {
+            if let Some(ip_be) = ipv4_str_to_be_u32(ip) {
+                let _ = skip_map.insert(ip_be, 1, 0);
+            }
+        }
+
+        // 2) attach XDP
+        let iface = if cfg.xdp_iface.trim().is_empty() || cfg.xdp_iface == "auto" {
+            detect_external_iface().unwrap_or_else(|| "eth0".to_string())
+        } else {
+            cfg.xdp_iface.clone()
+        };
+
+        let xdp_program: &mut Xdp = bpf
+            .program_mut("xdp_flow5tuple")
+            .context("program xdp_flow5tuple not found")?
+            .try_into()?;
+        xdp_program.load().context("load xdp program")?;
+        xdp_program
+            .attach(&iface, XdpFlags::default())
+            .context("attach xdp program")?;
+
+        println!(
+            "Attached XDP: iface={} (event_kind=2 flow five-tuple).",
+            iface
+        );
+
+        let flow_map = bpf
+            .take_map("FLOW_EVENTS")
+            .context("map FLOW_EVENTS not found")?;
+        ringbuf_flow = Some(RingBuf::try_from(flow_map)?);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -146,7 +304,43 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 line: Some(line),
                 exit_code: None,
                 success: None,
+                flow_src_ip: None,
+                flow_dst_ip: None,
+                flow_src_port: None,
+                flow_dst_port: None,
+                flow_proto: None,
+                flow_payload_len: None,
             });
+        }
+
+        // read flow events (fast)
+        if let Some(ringbuf_flow) = ringbuf_flow.as_mut() {
+            while let Some(item) = ringbuf_flow.next() {
+                if item.len() < core::mem::size_of::<FlowEvent>() {
+                    continue;
+                }
+                let ptr = item.as_ptr() as *const FlowEvent;
+                // SAFETY: kernel wrote a C struct into the ringbuf; we only read it.
+                let ev = unsafe { core::ptr::read_unaligned(ptr) };
+
+                batcher.push(AgentEvent {
+                    event_kind: 2,
+                    ts_ms: now_ms,
+                    uid: 0,
+                    tgid: 0,
+                    pid: 0,
+                    comm: "xdp".to_string(),
+                    line: None,
+                    exit_code: None,
+                    success: None,
+                    flow_src_ip: Some(be_u32_to_ipv4_str(ev.src_ip)),
+                    flow_dst_ip: Some(be_u32_to_ipv4_str(ev.dst_ip)),
+                    flow_src_port: Some(ev.src_port),
+                    flow_dst_port: Some(ev.dst_port),
+                    flow_proto: Some(ev.proto),
+                    flow_payload_len: Some(ev.payload_len),
+                });
+            }
         }
 
         // 2) flush trigger: size/time/max_events

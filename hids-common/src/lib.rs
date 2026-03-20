@@ -53,3 +53,21 @@ pub struct ExitEvent {
     /// 退出码（尽量按 i32 记录；通常 0 表示成功）
     pub exit_code: i32,
 }
+
+/// XDP 五元组流量事件（IPv4 + TCP/UDP）。
+///
+/// 说明：这里发的是“每个符合条件的数据包”的五元组，而不是聚合统计。
+/// 后续如果你想降低发送量，可以把内核改成聚合后再发送。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlowEvent {
+    pub ts: u64,
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    /// IP 协议号：6=TCP，17=UDP
+    pub proto: u8,
+    /// IP 头部之后的传输层长度（粗略）
+    pub payload_len: u32,
+}

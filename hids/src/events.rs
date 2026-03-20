@@ -16,6 +16,20 @@ pub struct AgentEvent {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
+
+    /// event_kind=2：网络五元组（IPv4 + TCP/UDP）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_src_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_dst_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_src_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_dst_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_proto: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_payload_len: Option<u32>,
 }
 
 /// 一次 HTTP 发送的“批次包裹层”，用于携带版本信息并保持事件数组不变。

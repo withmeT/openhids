@@ -31,6 +31,15 @@ pub struct Config {
 
     /// 配置文件热重载轮询间隔（秒）。
     pub config_reload_interval_secs: u64,
+
+    /// 是否启用 XDP 五元组采集。
+    pub xdp_enabled: bool,
+    /// XDP 挂载接口（网卡名）。
+    ///
+    /// 特殊值：`auto` 表示自动识别外联网卡（默认）。
+    pub xdp_iface: String,
+    /// 需要跳过监听的 IPv4 地址列表（字符串形式，如 `1.2.3.4`）。
+    pub xdp_skip_ips: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -52,6 +61,10 @@ struct PartialConfig {
     spool_drain_interval_secs: Option<u64>,
 
     config_reload_interval_secs: Option<u64>,
+
+    xdp_enabled: Option<bool>,
+    xdp_iface: Option<String>,
+    xdp_skip_ips: Option<Vec<String>>,
 }
 
 impl Config {
@@ -74,6 +87,10 @@ impl Config {
             spool_drain_interval_secs: 2,
 
             config_reload_interval_secs: 5,
+
+            xdp_enabled: true,
+            xdp_iface: "auto".to_string(),
+            xdp_skip_ips: Vec::new(),
         };
 
         // Optional config file (JSON)
@@ -118,6 +135,23 @@ impl Config {
             parse_env_u64("HIDS_CONFIG_RELOAD_INTERVAL_SECS")
                 .unwrap_or(cfg.config_reload_interval_secs);
 
+        cfg.xdp_enabled = std::env::var("HIDS_XDP_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.xdp_enabled);
+
+        cfg.xdp_iface = std::env::var("HIDS_XDP_IFACE").unwrap_or(cfg.xdp_iface);
+
+        // env: HIDS_XDP_SKIP_IPS=1.1.1.1,2.2.2.2
+        let env_skip = std::env::var("HIDS_XDP_SKIP_IPS").ok();
+        if let Some(v) = env_skip {
+            cfg.xdp_skip_ips = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
         Ok(cfg)
     }
 
@@ -154,6 +188,16 @@ impl Config {
         }
         if let Some(v) = partial.config_reload_interval_secs {
             self.config_reload_interval_secs = v;
+        }
+
+        if let Some(v) = partial.xdp_enabled {
+            self.xdp_enabled = v;
+        }
+        if let Some(v) = partial.xdp_iface {
+            self.xdp_iface = v;
+        }
+        if let Some(v) = partial.xdp_skip_ips {
+            self.xdp_skip_ips = v;
         }
     }
 }

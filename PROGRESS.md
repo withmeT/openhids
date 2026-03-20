@@ -38,7 +38,7 @@
 ## 2. 当前缺口（尚未实现）
 
 - 文件变动检测（占位模块，未做实际采集逻辑）
-- XDP 流量分析（占位模块，未做实际 eBPF 采集与用户态聚合/发送）
+- XDP 流量分析：已实现“基线可用链路”（XDP 提取 IPv4 + TCP/UDP 五元组并发送），但还没做“聚合统计 + 威胁规则/告警触发”
 - 多探针的统一事件模式（目前事件格式只覆盖命令记录；后续会增加网络/文件等事件类型）
 - ES 索引/字段模板（目前只是本地 HTTP + json 验证链路）
 
@@ -61,11 +61,14 @@
 推荐实现顺序（不改变你现有可靠送达框架）：
 
 1. 基线：先做“可用的网络流聚合”（XDP 侧仅做 L3/L4 分类）
-   - 解析：IPv4/IPv6 + TCP/UDP
-   - key：5-tuple（先做准确聚合）；威胁检测可以额外准备更粗粒度 key（如 `src_ip + dst_port`）
-   - 内核侧 map：
-     - `FLOW_STATS`：每个 flow 的包数/字节数/首次与最后时间戳
-     - `THREAT_COUNTERS`：按威胁类型聚合计数（用于阈值触发）
+   - 已完成（当前最小可用）：XDP 解析 IPv4 + TCP/UDP，并把每个符合条件的数据包的五元组以 `event_kind=2` 发到接收端
+   - key：五元组（`flow_src_ip/flow_dst_ip/flow_src_port/flow_dst_port/flow_proto`）
+   - 白名单跳过：新增 `SKIP_IPS`（用户态下发“本机 IP + 配置的 skip IP”，源/目的命中都会跳过）
+   - 配置入口：
+     - `HIDS_XDP_ENABLED`（默认 `true`）
+     - `HIDS_XDP_IFACE`（默认 `auto`）
+     - `HIDS_XDP_SKIP_IPS`（默认空；如 `1.2.3.4,5.6.7.8`）
+   - 仍未完成：对 flow 做包/字节计数聚合（`FLOW_STATS` 统计 map）和威胁阈值触发（`THREAT_COUNTERS`）
 2. 威胁检测：把你要识别的攻击拆成可落地的特征类别（先支持明文，后续再增强）
    - 现实约束：SSH/MySQL/HTTPS 常见是加密的
    - 建议优先用“行为/协议特征”：

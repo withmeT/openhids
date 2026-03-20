@@ -15,6 +15,10 @@
 
   "spool_drain_interval_secs": 2,
 
-  "config_reload_interval_secs": 5
+  "config_reload_interval_secs": 5,
+
+  "xdp_enabled": true,
+  "xdp_iface": "auto",
+  "xdp_skip_ips": []
 }
 
