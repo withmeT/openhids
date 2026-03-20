@@ -5,3 +5,9 @@ use aya_ebpf::maps::RingBuf;
 #[map(name = "EVENTS")]
 pub static mut EVENTS: RingBuf = RingBuf::with_byte_size(8 * 1024 * 1024, 0);
 
+#[map(name = "EXEC_EVENTS")]
+pub static mut EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[map(name = "EXIT_EVENTS")]
+pub static mut EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+

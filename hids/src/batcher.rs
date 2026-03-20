@@ -24,14 +24,27 @@ impl Batcher {
         }
     }
 
+    /// 热更新批量阈值，不影响当前未 flush 的事件数组。
+    pub fn update_params(
+        &mut self,
+        flush_bytes: usize,
+        flush_interval: Duration,
+        flush_max_events: usize,
+    ) {
+        self.flush_bytes = flush_bytes;
+        self.flush_interval = flush_interval;
+        self.flush_max_events = flush_max_events;
+    }
+
     pub fn push(&mut self, ev: AgentEvent) {
         if self.started_at.is_none() {
             self.started_at = Some(std::time::Instant::now());
         }
         // rough estimate; real size determined at serialization time
+        let line_len = ev.line.as_ref().map(|s| s.len()).unwrap_or(0);
         self.current_bytes_est = self
             .current_bytes_est
-            .saturating_add(ev.comm.len() + ev.line.len() + 64);
+            .saturating_add(ev.comm.len() + line_len + 64);
         self.current.push(ev);
     }
 

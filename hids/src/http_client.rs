@@ -1,15 +1,18 @@
-use crate::{events::AgentEvent, spool::Spool};
+use crate::{
+    events::IngestEnvelope,
+    spool::Spool,
+};
 
 use anyhow::Context as _;
 
-async fn send_batch(
+async fn send_envelope(
     client: &reqwest::Client,
     url: &str,
-    batch: &[AgentEvent],
+    envelope: &IngestEnvelope,
 ) -> anyhow::Result<()> {
     let res = client
         .post(url)
-        .json(batch)
+        .json(envelope)
         .send()
         .await
         .context("send http request")?;
@@ -33,7 +36,7 @@ pub async fn drain_spool(
             Ok(b) => b,
             Err(_) => continue,
         };
-        let batch: Vec<AgentEvent> = match serde_json::from_slice(&bytes) {
+        let envelope: IngestEnvelope = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(_) => {
                 let _ = std::fs::remove_file(&f);
@@ -41,7 +44,7 @@ pub async fn drain_spool(
             }
         };
 
-        if send_batch(client, url, &batch).await.is_ok() {
+        if send_envelope(client, url, &envelope).await.is_ok() {
             let _ = std::fs::remove_file(&f);
         } else {
             // network/server still bad; stop here
@@ -51,11 +54,5 @@ pub async fn drain_spool(
     Ok(())
 }
 
-pub async fn send_pending_batch(
-    client: &reqwest::Client,
-    url: &str,
-    batch: &[AgentEvent],
-) -> anyhow::Result<()> {
-    send_batch(client, url, batch).await
-}
+// Intentionally no extra helpers for now; sending is handled inline in `agent.rs`.
 

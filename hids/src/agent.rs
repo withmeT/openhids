@@ -10,7 +10,8 @@ use aya::programs::UProbe;
 
 use crate::{
     batcher::Batcher,
-    events::AgentEvent,
+    config::Config,
+    events::{AgentEvent, IngestEnvelope},
     http_client::drain_spool,
     spool::Spool,
     utils::cstr_from_fixed,
@@ -18,14 +19,14 @@ use crate::{
 
 use hids_common::CommandEvent;
 
-async fn send_batch(
+async fn send_envelope(
     client: &reqwest::Client,
     url: &str,
-    batch: &[AgentEvent],
+    envelope: &IngestEnvelope,
 ) -> anyhow::Result<()> {
     let res = client
         .post(url)
-        .json(batch)
+        .json(envelope)
         .send()
         .await
         .context("send http request")?;
@@ -38,24 +39,21 @@ async fn send_batch(
 }
 
 pub async fn run() -> Result<(), anyhow::Error> {
-    let ingest_url =
-        std::env::var("HIDS_INGEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8000/ingest".to_string());
+    let mut cfg = Config::load()?;
 
-    let flush_bytes = std::env::var("HIDS_FLUSH_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1 * 1024 * 1024);
-    let flush_interval_ms = std::env::var("HIDS_FLUSH_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2_000);
-    let flush_max_events = std::env::var("HIDS_FLUSH_MAX_EVENTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2000);
+    const AGENT_VERSION: &str = env!("HIDS_GIT_SHA");
+    let schema_version: u32 = env!("HIDS_SCHEMA_VERSION")
+        .parse()
+        .unwrap_or(1);
+    let agent_version: String = AGENT_VERSION.to_string();
+
+    println!(
+        "hids agent start: version={} schema_version={}",
+        AGENT_VERSION, schema_version
+    );
 
     // disk spool budget: <= 100MB as requested
-    let spool = Spool::new("./spool", 100 * 1024 * 1024);
+    let spool = Spool::new(cfg.spool_dir.clone(), cfg.spool_max_bytes);
 
     // Built by `hids/build.rs` into OUT_DIR.
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(env!("OUT_DIR"), "/hids")))?;
@@ -72,8 +70,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     println!("Attached to /bin/bash:readline. Type commands in bash to see events.");
 
-    let events_map = bpf.map_mut("EVENTS").context("map EVENTS not found")?;
-    let mut ringbuf = RingBuf::try_from(events_map)?;
+    let events_map = bpf
+        .take_map("EVENTS")
+        .context("map EVENTS not found")?;
+    let mut ringbuf_cmd = RingBuf::try_from(events_map)?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -81,25 +81,51 @@ pub async fn run() -> Result<(), anyhow::Error> {
         .context("build http client")?;
 
     let mut batcher = Batcher::new(
-        flush_bytes,
-        Duration::from_millis(flush_interval_ms),
-        flush_max_events,
+        cfg.flush_bytes,
+        Duration::from_millis(cfg.flush_interval_ms),
+        cfg.flush_max_events,
     );
 
     // pending serialized batches kept in memory before spilling
-    let mem_queue_max: usize = 10 * 1024 * 1024;
+    let mut mem_queue_max: usize = cfg.mem_queue_max_bytes;
     let mut pending: VecDeque<Vec<AgentEvent>> = VecDeque::new();
     let mut pending_bytes: usize = 0;
-
-    let max_send_batches_per_iter: usize = std::env::var("HIDS_MAX_SEND_BATCHES_PER_ITER")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2);
+    let mut max_send_batches_per_iter: usize = cfg.max_send_batches_per_iter;
+    let mut spool_drain_interval_secs: u64 = cfg.spool_drain_interval_secs;
+    let mut last_cfg_reload = std::time::Instant::now();
 
     let mut last_spool_drain = std::time::Instant::now();
+
     loop {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // 0) hot reload config (best-effort)
+        if last_cfg_reload.elapsed().as_secs() >= cfg.config_reload_interval_secs {
+            if let Ok(new_cfg) = Config::load() {
+                // Keep spool configuration stable during runtime to avoid inconsistencies.
+                cfg.ingest_url = new_cfg.ingest_url;
+
+                mem_queue_max = new_cfg.mem_queue_max_bytes;
+                max_send_batches_per_iter = new_cfg.max_send_batches_per_iter;
+                spool_drain_interval_secs = new_cfg.spool_drain_interval_secs;
+
+                // Update flush thresholds for the next flush window.
+                batcher.update_params(
+                    new_cfg.flush_bytes,
+                    Duration::from_millis(new_cfg.flush_interval_ms),
+                    new_cfg.flush_max_events,
+                );
+
+                cfg.host_id = new_cfg.host_id;
+                last_cfg_reload = std::time::Instant::now();
+            }
+        }
+
         // 1) read events (fast)
-        while let Some(item) = ringbuf.next() {
+        while let Some(item) = ringbuf_cmd.next() {
             if item.len() < core::mem::size_of::<CommandEvent>() {
                 continue;
             }
@@ -108,18 +134,18 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let ev = unsafe { core::ptr::read_unaligned(ptr) };
             let comm = cstr_from_fixed(&ev.comm);
             let line = cstr_from_fixed(&ev.line);
-            let ts_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let ts_ms = now_ms;
 
             batcher.push(AgentEvent {
+                event_kind: 0,
                 ts_ms,
                 uid: ev.uid,
                 tgid: ev.tgid,
                 pid: ev.pid,
                 comm,
-                line,
+                line: Some(line),
+                exit_code: None,
+                success: None,
             });
         }
 
@@ -143,10 +169,16 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 break;
             }
 
-            let body = serde_json::to_vec(&batch).unwrap_or_default();
+            let envelope = IngestEnvelope {
+                agent_version: agent_version.clone(),
+                schema_version,
+                host_id: Some(cfg.host_id.clone()),
+                events: batch,
+            };
+            let body = serde_json::to_vec(&envelope).unwrap_or_default();
             pending_bytes = pending_bytes.saturating_sub(body.len());
 
-            match send_batch(&client, &ingest_url, &batch).await {
+            match send_envelope(&client, &cfg.ingest_url, &envelope).await {
                 Ok(()) => {}
                 Err(err) => {
                     eprintln!("send failed: {err}; spooling");
@@ -157,7 +189,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
             // backpressure: if too much queued in memory, spill oldest to disk
             if pending_bytes > mem_queue_max {
                 if let Some(old) = pending.pop_front() {
-                    let bytes = serde_json::to_vec(&old).unwrap_or_default();
+                    let old_env = IngestEnvelope {
+                        agent_version: agent_version.clone(),
+                        schema_version,
+                        host_id: Some(cfg.host_id.clone()),
+                        events: old,
+                    };
+                    let bytes = serde_json::to_vec(&old_env).unwrap_or_default();
                     pending_bytes = pending_bytes.saturating_sub(bytes.len());
                     let _ = spool.enqueue(&bytes);
                 }
@@ -167,8 +205,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
 
         // 4) periodically drain spool (if network is back)
-        if last_spool_drain.elapsed() >= Duration::from_secs(2) {
-            let _ = drain_spool(&client, &ingest_url, &spool).await;
+        if last_spool_drain.elapsed() >= Duration::from_secs(spool_drain_interval_secs) {
+            let _ = drain_spool(&client, &cfg.ingest_url, &spool).await;
             last_spool_drain = std::time::Instant::now();
         }
 

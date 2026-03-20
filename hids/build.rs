@@ -1,7 +1,40 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
+fn inject_build_version() -> anyhow::Result<()> {
+    // Default schema version for event compatibility.
+    // You can override at build time: HIDS_SCHEMA_VERSION=2 cargo build ...
+    let schema_version = std::env::var("HIDS_SCHEMA_VERSION").unwrap_or_else(|_| "1".to_string());
+
+    // Try to read git SHA (best-effort).
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let repo_root = std::path::PathBuf::from(manifest_dir).join("..");
+    let git_sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(&repo_root)
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dev".to_string());
+
+    println!("cargo:rustc-env=HIDS_GIT_SHA={git_sha}");
+    println!("cargo:rustc-env=HIDS_SCHEMA_VERSION={schema_version}");
+
+    // Re-run if schema version changes.
+    println!("cargo:rerun-if-env-changed=HIDS_SCHEMA_VERSION");
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    inject_build_version()?;
+
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

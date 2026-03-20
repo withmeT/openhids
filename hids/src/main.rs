@@ -1,4 +1,5 @@
 mod agent;
+mod config;
 mod batcher;
 mod events;
 mod http_client;

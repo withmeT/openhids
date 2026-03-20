@@ -23,3 +23,33 @@ pub struct CommandEvent {
     /// `line` 的有效长度（包含 NUL 时也会算在内；具体取决于 helper 返回值）。
     pub len: u32,
 }
+
+/// execve（进程启动）事件，用于将 bash 输入的命令与其子进程关联。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExecEvent {
+    /// 线程 pid（下 32 位）
+    pub pid: u32,
+    /// 进程 tgid（上 32 位）
+    pub tgid: u32,
+    /// 用户 ID
+    pub uid: u32,
+    /// 当前进程名（comm），16 字节
+    pub comm: [u8; COMM_LEN],
+}
+
+/// 进程退出事件（exit/exit_group），携带 exit code。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExitEvent {
+    /// 线程 pid（下 32 位）
+    pub pid: u32,
+    /// 进程 tgid（上 32 位）
+    pub tgid: u32,
+    /// 用户 ID
+    pub uid: u32,
+    /// 当前进程名（comm），16 字节
+    pub comm: [u8; COMM_LEN],
+    /// 退出码（尽量按 i32 记录；通常 0 表示成功）
+    pub exit_code: i32,
+}

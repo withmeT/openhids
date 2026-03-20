@@ -32,7 +32,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         now = time.time()
-        items = payload if isinstance(payload, list) else [payload]
+        if isinstance(payload, dict) and "events" in payload:
+            meta = {
+                "agent_version": payload.get("agent_version"),
+                "schema_version": payload.get("schema_version"),
+                "host_id": payload.get("host_id"),
+            }
+            items = payload.get("events") or []
+            # attach metadata to each written event
+            items = [
+                {**it, **{k: v for k, v in meta.items() if v is not None}}
+                for it in items
+                if isinstance(it, dict)
+            ]
+        else:
+            items = payload if isinstance(payload, list) else [payload]
         print(
             f"[{time.strftime('%F %T')}] received batches=1 items={len(items)} bytes={len(raw)}",
             flush=True,

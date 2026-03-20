@@ -3,11 +3,28 @@ use serde::{Deserialize, Serialize};
 /// 单条从 eBPF ringbuf 拉取到用户态的“命令事件”，随后会被 batch/压缩后发送到接收端。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
+    /// 事件类型：0=命令输入，1=命令执行结果
+    pub event_kind: u8,
     pub ts_ms: u64,
     pub uid: u32,
     pub tgid: u32,
     pub pid: u32,
     pub comm: String,
-    pub line: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+}
+
+/// 一次 HTTP 发送的“批次包裹层”，用于携带版本信息并保持事件数组不变。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestEnvelope {
+    pub agent_version: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    pub events: Vec<AgentEvent>,
 }
 
