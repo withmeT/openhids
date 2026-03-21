@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,6 +9,12 @@ use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::RingBuf;
 use aya::maps::HashMap as AyaHashMap;
 use aya::programs::{UProbe, Xdp, XdpFlags};
+use pnet_datalink::{self, Channel, Config as DatalinkConfig};
+use pnet_packet::Packet;
+use pnet_packet::ethernet::{EtherTypes, EthernetPacket};
+use pnet_packet::ip::IpNextHeaderProtocols;
+use pnet_packet::ipv4::Ipv4Packet;
+use pnet_packet::tcp::TcpPacket;
 
 use crate::{
     batcher::Batcher,
@@ -52,6 +59,135 @@ fn detect_local_ipv4s() -> Vec<String> {
     s.split_whitespace()
         .filter_map(|tok| ipv4_str_to_be_u32(tok).map(|_| tok.to_string()))
         .collect()
+}
+
+#[derive(Debug)]
+struct HttpL7Event {
+    src_ip: String,
+    dst_ip: String,
+    src_port: u16,
+    dst_port: u16,
+    method: String,
+    url: String,
+    body_trunc: String,
+}
+
+fn sanitize_text_200(s: &str) -> String {
+    let mut out = String::with_capacity(200);
+    for ch in s.chars() {
+        if out.len() >= 200 {
+            break;
+        }
+        if ch.is_ascii_graphic() || ch == ' ' {
+            out.push(ch);
+        } else {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn parse_http_l7(payload: &[u8]) -> Option<(String, String, String)> {
+    let text = String::from_utf8_lossy(payload);
+    let mut lines = text.split("\r\n");
+    let first = lines.next()?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next()?.to_string();
+    let url = parts.next().unwrap_or("/").to_string();
+
+    // Basic method guard
+    match method.as_str() {
+        "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" => {}
+        _ => return None,
+    }
+
+    let body = if let Some(idx) = text.find("\r\n\r\n") {
+        &text[idx + 4..]
+    } else {
+        ""
+    };
+    Some((
+        sanitize_text_200(&method),
+        sanitize_text_200(&url),
+        sanitize_text_200(body),
+    ))
+}
+
+fn spawn_http_sniffer(
+    iface_name: String,
+    local_ips: Vec<String>,
+    http_ports: Vec<u16>,
+) -> mpsc::Receiver<HttpL7Event> {
+    let (tx, rx) = mpsc::channel::<HttpL7Event>();
+    std::thread::spawn(move || {
+        let local_set: std::collections::HashSet<String> = local_ips.into_iter().collect();
+        let http_port_set: std::collections::HashSet<u16> = http_ports.into_iter().collect();
+        let interfaces = pnet_datalink::interfaces();
+        let Some(interface) = interfaces.into_iter().find(|i| i.name == iface_name) else {
+            return;
+        };
+
+        let cfg = DatalinkConfig {
+            read_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+
+        let chan = pnet_datalink::channel(&interface, cfg);
+        let Ok(Channel::Ethernet(_tx, mut rx_dl)) = chan else {
+            return;
+        };
+
+        loop {
+            let Ok(frame) = rx_dl.next() else {
+                continue;
+            };
+            let Some(eth) = EthernetPacket::new(frame) else {
+                continue;
+            };
+            if eth.get_ethertype() != EtherTypes::Ipv4 {
+                continue;
+            }
+            let Some(ip) = Ipv4Packet::new(eth.payload()) else {
+                continue;
+            };
+            if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
+                continue;
+            }
+            let src_ip = ip.get_source().to_string();
+            let dst_ip = ip.get_destination().to_string();
+
+            // inbound only
+            if !local_set.contains(&dst_ip) {
+                continue;
+            }
+
+            let Some(tcp) = TcpPacket::new(ip.payload()) else {
+                continue;
+            };
+            let dst_port = tcp.get_destination();
+            if !http_port_set.contains(&dst_port) {
+                continue;
+            }
+            let payload = tcp.payload();
+            if payload.is_empty() {
+                continue;
+            }
+            let Some((method, url, body_trunc)) = parse_http_l7(payload) else {
+                continue;
+            };
+
+            let _ = tx.send(HttpL7Event {
+                src_ip,
+                dst_ip,
+                src_port: tcp.get_source(),
+                dst_port,
+                method,
+                url,
+                body_trunc,
+            });
+        }
+    });
+    rx
 }
 
 fn parse_dev_from_ip_route(s: &str) -> Option<String> {
@@ -185,19 +321,24 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     // XDP flow collection (five tuple)
     let mut ringbuf_flow = None;
+    let mut http_l7_rx: Option<mpsc::Receiver<HttpL7Event>> = None;
     if cfg.xdp_enabled {
-        // 1) configure skip map (local + configured ips)
-        let mut skip_map = AyaHashMap::<_, u32, u8>::try_from(
-            bpf.map_mut("SKIP_IPS").context("map SKIP_IPS not found")?,
-        )?;
+        // 1) configure maps
+        let skip_map_data = bpf.take_map("SKIP_IPS").context("map SKIP_IPS not found")?;
+        let mut skip_map = AyaHashMap::<_, u32, u8>::try_from(skip_map_data)?;
 
-        // always skip loopback
+        let local_ips_map_data = bpf.take_map("LOCAL_IPS").context("map LOCAL_IPS not found")?;
+        let mut local_ips_map = AyaHashMap::<_, u32, u8>::try_from(local_ips_map_data)?;
+
+        // always mark loopback/local for direction detection
         if let Some(ip) = ipv4_str_to_be_u32("127.0.0.1") {
+            let _ = local_ips_map.insert(ip, 1, 0);
+            // keep loopback also in skip to avoid useless localhost traffic
             let _ = skip_map.insert(ip, 1, 0);
         }
         for ip in detect_local_ipv4s() {
             if let Some(ip_be) = ipv4_str_to_be_u32(&ip) {
-                let _ = skip_map.insert(ip_be, 1, 0);
+                let _ = local_ips_map.insert(ip_be, 1, 0);
             }
         }
         for ip in &cfg.xdp_skip_ips {
@@ -227,10 +368,19 @@ pub async fn run() -> Result<(), anyhow::Error> {
             iface
         );
 
+        // Formal approach: keep XDP lightweight and collect HTTP URL/body
+        // in userspace from the selected interface.
+        http_l7_rx = Some(spawn_http_sniffer(
+            iface.clone(),
+            detect_local_ipv4s(),
+            cfg.http_l7_ports.clone(),
+        ));
+
         let flow_map = bpf
             .take_map("FLOW_EVENTS")
             .context("map FLOW_EVENTS not found")?;
         ringbuf_flow = Some(RingBuf::try_from(flow_map)?);
+
     }
 
     let client = reqwest::Client::builder()
@@ -309,7 +459,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 flow_src_port: None,
                 flow_dst_port: None,
                 flow_proto: None,
+                flow_tcp_flags: None,
+                flow_direction: None,
+                flow_is_sensitive_port: None,
                 flow_payload_len: None,
+                http_payload_trunc: None,
+                http_trunc_len: None,
+                http_method: None,
+                http_url: None,
+                http_body_trunc: None,
             });
         }
 
@@ -338,7 +496,46 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     flow_src_port: Some(ev.src_port),
                     flow_dst_port: Some(ev.dst_port),
                     flow_proto: Some(ev.proto),
+                    flow_tcp_flags: Some(ev.tcp_flags),
+                    flow_direction: Some(ev.direction),
+                    flow_is_sensitive_port: Some(ev.is_sensitive_port != 0),
                     flow_payload_len: Some(ev.payload_len),
+                    http_payload_trunc: None,
+                    http_trunc_len: None,
+                    http_method: None,
+                    http_url: None,
+                    http_body_trunc: None,
+                });
+            }
+        }
+
+        // userspace HTTP L7 events (URL + body trunc)
+        if let Some(rx) = http_l7_rx.as_ref() {
+            while let Ok(ev) = rx.try_recv() {
+                batcher.push(AgentEvent {
+                    event_kind: 3,
+                    ts_ms: now_ms,
+                    uid: 0,
+                    tgid: 0,
+                    pid: 0,
+                    comm: "http_l7".to_string(),
+                    line: None,
+                    exit_code: None,
+                    success: None,
+                    flow_src_ip: Some(ev.src_ip),
+                    flow_dst_ip: Some(ev.dst_ip),
+                    flow_src_port: Some(ev.src_port),
+                    flow_dst_port: Some(ev.dst_port),
+                    flow_proto: Some(6),
+                    flow_tcp_flags: None,
+                    flow_direction: Some(1),
+                    flow_is_sensitive_port: Some(true),
+                    flow_payload_len: None,
+                    http_payload_trunc: None,
+                    http_trunc_len: Some(200),
+                    http_method: Some(ev.method),
+                    http_url: Some(ev.url),
+                    http_body_trunc: Some(ev.body_trunc),
                 });
             }
         }

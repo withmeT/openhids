@@ -68,6 +68,13 @@ pub struct FlowEvent {
     pub dst_port: u16,
     /// IP 协议号：6=TCP，17=UDP
     pub proto: u8,
+    /// TCP flags（仅当 proto=TCP 时有效）：SYN/ACK/RST/FIN/PSH/URG 等位图
+    pub tcp_flags: u8,
+    /// 方向：0=unknown 1=inbound 2=outbound
+    pub direction: u8,
+    /// dst_port 是否属于敏感端口（监控端口列表）
+    pub is_sensitive_port: u8,
     /// IP 头部之后的传输层长度（粗略）
     pub payload_len: u32,
 }
+

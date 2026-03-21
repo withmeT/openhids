@@ -40,6 +40,9 @@ pub struct Config {
     pub xdp_iface: String,
     /// 需要跳过监听的 IPv4 地址列表（字符串形式，如 `1.2.3.4`）。
     pub xdp_skip_ips: Vec<String>,
+
+    /// 用户态 HTTP L7 采集端口（明文 HTTP）。
+    pub http_l7_ports: Vec<u16>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -65,6 +68,7 @@ struct PartialConfig {
     xdp_enabled: Option<bool>,
     xdp_iface: Option<String>,
     xdp_skip_ips: Option<Vec<String>>,
+    http_l7_ports: Option<Vec<u16>>,
 }
 
 impl Config {
@@ -91,6 +95,7 @@ impl Config {
             xdp_enabled: true,
             xdp_iface: "auto".to_string(),
             xdp_skip_ips: Vec::new(),
+            http_l7_ports: vec![80, 8080, 8000],
         };
 
         // Optional config file (JSON)
@@ -152,6 +157,19 @@ impl Config {
                 .collect();
         }
 
+        // env: HIDS_HTTP_L7_PORTS=80,8080,8000
+        if let Ok(v) = std::env::var("HIDS_HTTP_L7_PORTS") {
+            let mut ports = Vec::new();
+            for p in v.split(',') {
+                if let Ok(pp) = p.trim().parse::<u16>() {
+                    ports.push(pp);
+                }
+            }
+            if !ports.is_empty() {
+                cfg.http_l7_ports = ports;
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -198,6 +216,9 @@ impl Config {
         }
         if let Some(v) = partial.xdp_skip_ips {
             self.xdp_skip_ips = v;
+        }
+        if let Some(v) = partial.http_l7_ports {
+            self.http_l7_ports = v;
         }
     }
 }

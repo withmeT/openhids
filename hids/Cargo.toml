@@ -26,6 +26,8 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
+pnet_datalink = "0.35"
+pnet_packet = "0.35"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

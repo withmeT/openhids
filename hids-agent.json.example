@@ -19,6 +19,7 @@
 
   "xdp_enabled": true,
   "xdp_iface": "auto",
-  "xdp_skip_ips": []
+  "xdp_skip_ips": [],
+  "http_l7_ports": [80, 8080, 8000]
 }
 

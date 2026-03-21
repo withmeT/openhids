@@ -42,9 +42,15 @@ impl Batcher {
         }
         // rough estimate; real size determined at serialization time
         let line_len = ev.line.as_ref().map(|s| s.len()).unwrap_or(0);
+        let http_len = ev.http_payload_trunc.as_ref().map(|s| s.len()).unwrap_or(0);
+        let http_method_len = ev.http_method.as_ref().map(|s| s.len()).unwrap_or(0);
+        let http_url_len = ev.http_url.as_ref().map(|s| s.len()).unwrap_or(0);
+        let http_body_len = ev.http_body_trunc.as_ref().map(|s| s.len()).unwrap_or(0);
         self.current_bytes_est = self
             .current_bytes_est
-            .saturating_add(ev.comm.len() + line_len + 64);
+            .saturating_add(
+                ev.comm.len() + line_len + http_len + http_method_len + http_url_len + http_body_len + 128,
+            );
         self.current.push(ev);
     }
 

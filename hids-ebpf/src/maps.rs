@@ -21,3 +21,9 @@ pub static mut FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 
 #[map(name = "SKIP_IPS")]
 pub static mut SKIP_IPS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
+/// 本机 IPv4 地址集合（用于判断 inbound/outbound）。
+///
+/// value 只是占位，用 1 表示命中。
+#[map(name = "LOCAL_IPS")]
+pub static mut LOCAL_IPS: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
