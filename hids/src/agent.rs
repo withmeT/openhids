@@ -1,7 +1,7 @@
 use std::{
-    collections::VecDeque,
-    sync::mpsc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{mpsc, Arc, RwLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context as _;
@@ -67,9 +67,16 @@ struct HttpL7Event {
     dst_ip: String,
     src_port: u16,
     dst_port: u16,
+    /// 请求方法；响应事件为空字符串。
     method: String,
+    /// 请求路径；响应事件为空字符串。
     url: String,
     body_trunc: String,
+    http_host: Option<String>,
+    http_cookie_trunc: Option<String>,
+    /// 仅响应：HTTP 状态码。
+    http_status: Option<u16>,
+    is_response: bool,
 }
 
 fn sanitize_text_200(s: &str) -> String {
@@ -87,41 +94,120 @@ fn sanitize_text_200(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn parse_http_l7(payload: &[u8]) -> Option<(String, String, String)> {
+/// 用户态 HTTP L7 嗅探线程与热重载共享的运行时参数（端口集合、静态路径过滤）。
+#[derive(Debug, Clone)]
+struct HttpL7Runtime {
+    pub http_port_set: HashSet<u16>,
+    pub ignore_path_prefixes: Vec<String>,
+    pub ignore_path_suffixes: Vec<String>,
+    pub capture_response: bool,
+}
+
+impl HttpL7Runtime {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            http_port_set: cfg.http_l7_ports.iter().copied().collect(),
+            ignore_path_prefixes: cfg.http_l7_ignore_path_prefixes.clone(),
+            ignore_path_suffixes: cfg.http_l7_ignore_path_suffixes.clone(),
+            capture_response: cfg.http_l7_capture_response,
+        }
+    }
+
+    /// 若应丢弃该 URL（静态资源等），返回 true。
+    pub fn should_drop_url(&self, url: &str) -> bool {
+        let path = url.split('?').next().unwrap_or(url);
+        let path_lc = path.to_ascii_lowercase();
+        for p in &self.ignore_path_prefixes {
+            if path.starts_with(p) {
+                return true;
+            }
+        }
+        for s in &self.ignore_path_suffixes {
+            let s_lc = s.to_ascii_lowercase();
+            if path_lc.ends_with(&s_lc) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// 与 XDP flow（入站 SYN）及 HTTP 请求对齐的关联键：客户端 -> 服务端。
+fn tcp_flow_correlation_key(src_ip: &str, src_port: u16, dst_ip: &str, dst_port: u16) -> String {
+    format!("tcp:{}:{}->{}:{}", src_ip, src_port, dst_ip, dst_port)
+}
+
+fn parse_http_request_details(payload: &[u8]) -> Option<(String, String, Option<String>, Option<String>, String)> {
     let text = String::from_utf8_lossy(payload);
-    let mut lines = text.split("\r\n");
+    let header_end = text.find("\r\n\r\n");
+    let header_part = if let Some(i) = header_end {
+        &text[..i]
+    } else {
+        text.as_ref()
+    };
+    let body = if let Some(i) = header_end {
+        &text[i + 4..]
+    } else {
+        ""
+    };
+
+    let mut lines = header_part.split("\r\n");
     let first = lines.next()?;
     let mut parts = first.split_whitespace();
     let method = parts.next()?.to_string();
     let url = parts.next().unwrap_or("/").to_string();
 
-    // Basic method guard
     match method.as_str() {
         "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" => {}
         _ => return None,
     }
 
-    let body = if let Some(idx) = text.find("\r\n\r\n") {
-        &text[idx + 4..]
-    } else {
-        ""
-    };
+    let mut host = None;
+    let mut cookie = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let n = name.trim();
+            let v = value.trim();
+            if n.eq_ignore_ascii_case("host") {
+                host = Some(sanitize_text_200(v));
+            } else if n.eq_ignore_ascii_case("cookie") {
+                cookie = Some(sanitize_text_200(v));
+            }
+        }
+    }
+
     Some((
         sanitize_text_200(&method),
         sanitize_text_200(&url),
+        host,
+        cookie,
         sanitize_text_200(body),
     ))
+}
+
+fn parse_http_response_status(payload: &[u8]) -> Option<u16> {
+    let text = String::from_utf8_lossy(payload);
+    let first = text.split("\r\n").next()?;
+    let mut parts = first.split_whitespace();
+    let ver = parts.next()?;
+    if !ver.to_ascii_uppercase().starts_with("HTTP/") {
+        return None;
+    }
+    let code = parts.next()?.parse::<u16>().ok()?;
+    Some(code)
 }
 
 fn spawn_http_sniffer(
     iface_name: String,
     local_ips: Vec<String>,
-    http_ports: Vec<u16>,
+    runtime: Arc<RwLock<HttpL7Runtime>>,
 ) -> mpsc::Receiver<HttpL7Event> {
     let (tx, rx) = mpsc::channel::<HttpL7Event>();
     std::thread::spawn(move || {
-        let local_set: std::collections::HashSet<String> = local_ips.into_iter().collect();
-        let http_port_set: std::collections::HashSet<u16> = http_ports.into_iter().collect();
+        let local_set: HashSet<String> = local_ips.into_iter().collect();
         let interfaces = pnet_datalink::interfaces();
         let Some(interface) = interfaces.into_iter().find(|i| i.name == iface_name) else {
             return;
@@ -156,35 +242,107 @@ fn spawn_http_sniffer(
             let src_ip = ip.get_source().to_string();
             let dst_ip = ip.get_destination().to_string();
 
-            // inbound only
-            if !local_set.contains(&dst_ip) {
-                continue;
-            }
-
             let Some(tcp) = TcpPacket::new(ip.payload()) else {
                 continue;
             };
-            let dst_port = tcp.get_destination();
-            if !http_port_set.contains(&dst_port) {
-                continue;
-            }
-            let payload = tcp.payload();
-            if payload.is_empty() {
-                continue;
-            }
-            let Some((method, url, body_trunc)) = parse_http_l7(payload) else {
-                continue;
-            };
 
-            let _ = tx.send(HttpL7Event {
-                src_ip,
-                dst_ip,
-                src_port: tcp.get_source(),
-                dst_port,
-                method,
-                url,
-                body_trunc,
-            });
+            let is_inbound_request = local_set.contains(&dst_ip);
+            let is_outbound_response =
+                local_set.contains(&src_ip) && !local_set.contains(&dst_ip);
+
+            if is_inbound_request {
+                let dst_port = tcp.get_destination();
+                {
+                    let rt = match runtime.read() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    if !rt.http_port_set.contains(&dst_port) {
+                        continue;
+                    }
+                }
+                let payload = tcp.payload();
+                if payload.is_empty() {
+                    continue;
+                }
+                let Some((method, url, host, cookie, body_trunc)) =
+                    parse_http_request_details(payload)
+                else {
+                    continue;
+                };
+
+                {
+                    let rt = match runtime.read() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    if rt.should_drop_url(&url) {
+                        continue;
+                    }
+                }
+
+                let _ = tx.send(HttpL7Event {
+                    src_ip,
+                    dst_ip,
+                    src_port: tcp.get_source(),
+                    dst_port,
+                    method,
+                    url,
+                    body_trunc,
+                    http_host: host,
+                    http_cookie_trunc: cookie,
+                    http_status: None,
+                    is_response: false,
+                });
+            } else if is_outbound_response {
+                let capture = {
+                    let rt = match runtime.read() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    rt.capture_response
+                };
+                if !capture {
+                    continue;
+                }
+                let src_port = tcp.get_source();
+                {
+                    let rt = match runtime.read() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    if !rt.http_port_set.contains(&src_port) {
+                        continue;
+                    }
+                }
+                let payload = tcp.payload();
+                if payload.is_empty() {
+                    continue;
+                }
+                let Some(status) = parse_http_response_status(payload) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(payload);
+                let body_trunc = if let Some(idx) = text.find("\r\n\r\n") {
+                    sanitize_text_200(&text[idx + 4..])
+                } else {
+                    String::new()
+                };
+
+                let _ = tx.send(HttpL7Event {
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port: tcp.get_destination(),
+                    method: String::new(),
+                    url: String::new(),
+                    body_trunc,
+                    http_host: None,
+                    http_cookie_trunc: None,
+                    http_status: Some(status),
+                    is_response: true,
+                });
+            }
         }
     });
     rx
@@ -322,6 +480,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
     // XDP flow collection (five tuple)
     let mut ringbuf_flow = None;
     let mut http_l7_rx: Option<mpsc::Receiver<HttpL7Event>> = None;
+    let mut http_l7_runtime: Option<Arc<RwLock<HttpL7Runtime>>> = None;
     if cfg.xdp_enabled {
         // 1) configure maps
         let skip_map_data = bpf.take_map("SKIP_IPS").context("map SKIP_IPS not found")?;
@@ -329,6 +488,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
         let local_ips_map_data = bpf.take_map("LOCAL_IPS").context("map LOCAL_IPS not found")?;
         let mut local_ips_map = AyaHashMap::<_, u32, u8>::try_from(local_ips_map_data)?;
+        let sensitive_ports_map_data = bpf
+            .take_map("SENSITIVE_PORTS")
+            .context("map SENSITIVE_PORTS not found")?;
+        let mut sensitive_ports_map = AyaHashMap::<_, u16, u8>::try_from(sensitive_ports_map_data)?;
+        let capture_all_ports_map_data = bpf
+            .take_map("CAPTURE_ALL_PORTS")
+            .context("map CAPTURE_ALL_PORTS not found")?;
+        let mut capture_all_ports_map =
+            AyaHashMap::<_, u8, u8>::try_from(capture_all_ports_map_data)?;
 
         // always mark loopback/local for direction detection
         if let Some(ip) = ipv4_str_to_be_u32("127.0.0.1") {
@@ -345,6 +513,12 @@ pub async fn run() -> Result<(), anyhow::Error> {
             if let Some(ip_be) = ipv4_str_to_be_u32(ip) {
                 let _ = skip_map.insert(ip_be, 1, 0);
             }
+        }
+        for p in &cfg.xdp_sensitive_ports {
+            let _ = sensitive_ports_map.insert(*p, 1, 0);
+        }
+        if cfg.xdp_capture_all_ports {
+            let _ = capture_all_ports_map.insert(0, 1, 0);
         }
 
         // 2) attach XDP
@@ -370,10 +544,12 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
         // Formal approach: keep XDP lightweight and collect HTTP URL/body
         // in userspace from the selected interface.
+        let rt = Arc::new(RwLock::new(HttpL7Runtime::from_config(&cfg)));
+        http_l7_runtime = Some(rt.clone());
         http_l7_rx = Some(spawn_http_sniffer(
             iface.clone(),
             detect_local_ipv4s(),
-            cfg.http_l7_ports.clone(),
+            rt,
         ));
 
         let flow_map = bpf
@@ -404,6 +580,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     let mut last_spool_drain = std::time::Instant::now();
 
+    // HTTP L7 去重：相同五元组 + 请求/响应语义标签 在窗口内只上报一次。
+    type HttpDedupKey = (String, String, u16, u16, String);
+    let mut http_dedup: HashMap<HttpDedupKey, u64> = HashMap::new();
+    let mut last_http_dedup_prune = Instant::now();
+
     loop {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -413,6 +594,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
         // 0) hot reload config (best-effort)
         if last_cfg_reload.elapsed().as_secs() >= cfg.config_reload_interval_secs {
             if let Ok(new_cfg) = Config::load() {
+                // HTTP L7：端口与静态路径过滤可热更新（与嗅探线程共享；需先借用 new_cfg）。
+                if let Some(rt) = http_l7_runtime.as_ref() {
+                    if let Ok(mut w) = rt.write() {
+                        *w = HttpL7Runtime::from_config(&new_cfg);
+                    }
+                }
+
                 // Keep spool configuration stable during runtime to avoid inconsistencies.
                 cfg.ingest_url = new_cfg.ingest_url;
 
@@ -427,9 +615,26 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     new_cfg.flush_max_events,
                 );
 
+                cfg.http_l7_dedup_window_ms = new_cfg.http_l7_dedup_window_ms;
+                cfg.http_l7_ignore_path_prefixes = new_cfg.http_l7_ignore_path_prefixes.clone();
+                cfg.http_l7_ignore_path_suffixes = new_cfg.http_l7_ignore_path_suffixes.clone();
+                cfg.http_l7_ports = new_cfg.http_l7_ports.clone();
+                cfg.http_l7_capture_response = new_cfg.http_l7_capture_response;
+
                 cfg.host_id = new_cfg.host_id;
+
                 last_cfg_reload = std::time::Instant::now();
             }
+        }
+
+        // 去重表定期裁剪，避免长期运行内存增长。
+        if last_http_dedup_prune.elapsed() >= Duration::from_secs(60) {
+            let max_age = cfg
+                .http_l7_dedup_window_ms
+                .saturating_mul(10)
+                .max(60_000);
+            http_dedup.retain(|_, ts| now_ms.saturating_sub(*ts) < max_age);
+            last_http_dedup_prune = Instant::now();
         }
 
         // 1) read events (fast)
@@ -454,6 +659,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 line: Some(line),
                 exit_code: None,
                 success: None,
+                flow_correlation_key: None,
                 flow_src_ip: None,
                 flow_dst_ip: None,
                 flow_src_port: None,
@@ -468,6 +674,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 http_method: None,
                 http_url: None,
                 http_body_trunc: None,
+                http_host: None,
+                http_cookie_trunc: None,
+                http_status: None,
             });
         }
 
@@ -481,6 +690,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 // SAFETY: kernel wrote a C struct into the ringbuf; we only read it.
                 let ev = unsafe { core::ptr::read_unaligned(ptr) };
 
+                let s_ip = be_u32_to_ipv4_str(ev.src_ip);
+                let d_ip = be_u32_to_ipv4_str(ev.dst_ip);
+                let flow_key = tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
+
                 batcher.push(AgentEvent {
                     event_kind: 2,
                     ts_ms: now_ms,
@@ -491,8 +704,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     line: None,
                     exit_code: None,
                     success: None,
-                    flow_src_ip: Some(be_u32_to_ipv4_str(ev.src_ip)),
-                    flow_dst_ip: Some(be_u32_to_ipv4_str(ev.dst_ip)),
+                    flow_correlation_key: Some(flow_key),
+                    flow_src_ip: Some(s_ip),
+                    flow_dst_ip: Some(d_ip),
                     flow_src_port: Some(ev.src_port),
                     flow_dst_port: Some(ev.dst_port),
                     flow_proto: Some(ev.proto),
@@ -505,6 +719,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     http_method: None,
                     http_url: None,
                     http_body_trunc: None,
+                    http_host: None,
+                    http_cookie_trunc: None,
+                    http_status: None,
                 });
             }
         }
@@ -512,6 +729,40 @@ pub async fn run() -> Result<(), anyhow::Error> {
         // userspace HTTP L7 events (URL + body trunc)
         if let Some(rx) = http_l7_rx.as_ref() {
             while let Ok(ev) = rx.try_recv() {
+                let window_ms = cfg.http_l7_dedup_window_ms;
+                if window_ms > 0 {
+                    let dedup_tag = if ev.is_response {
+                        format!("RESP:{}", ev.http_status.unwrap_or(0))
+                    } else {
+                        format!(
+                            "REQ:{}:{}|{}",
+                            ev.method,
+                            ev.url,
+                            ev.http_host.as_deref().unwrap_or("")
+                        )
+                    };
+                    let key = (
+                        ev.src_ip.clone(),
+                        ev.dst_ip.clone(),
+                        ev.src_port,
+                        ev.dst_port,
+                        dedup_tag,
+                    );
+                    if let Some(&last) = http_dedup.get(&key) {
+                        if now_ms.saturating_sub(last) < window_ms {
+                            continue;
+                        }
+                    }
+                    http_dedup.insert(key, now_ms);
+                }
+
+                let flow_key = if ev.is_response {
+                    // 出站响应：包内 src=服务端，dst=客户端 → 规范化为 客户端->服务端
+                    tcp_flow_correlation_key(&ev.dst_ip, ev.dst_port, &ev.src_ip, ev.src_port)
+                } else {
+                    tcp_flow_correlation_key(&ev.src_ip, ev.src_port, &ev.dst_ip, ev.dst_port)
+                };
+
                 batcher.push(AgentEvent {
                     event_kind: 3,
                     ts_ms: now_ms,
@@ -522,20 +773,32 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     line: None,
                     exit_code: None,
                     success: None,
+                    flow_correlation_key: Some(flow_key),
                     flow_src_ip: Some(ev.src_ip),
                     flow_dst_ip: Some(ev.dst_ip),
                     flow_src_port: Some(ev.src_port),
                     flow_dst_port: Some(ev.dst_port),
                     flow_proto: Some(6),
                     flow_tcp_flags: None,
-                    flow_direction: Some(1),
+                    flow_direction: Some(if ev.is_response { 2 } else { 1 }),
                     flow_is_sensitive_port: Some(true),
                     flow_payload_len: None,
                     http_payload_trunc: None,
                     http_trunc_len: Some(200),
-                    http_method: Some(ev.method),
-                    http_url: Some(ev.url),
+                    http_method: if ev.is_response {
+                        None
+                    } else {
+                        Some(ev.method)
+                    },
+                    http_url: if ev.is_response {
+                        None
+                    } else {
+                        Some(ev.url)
+                    },
                     http_body_trunc: Some(ev.body_trunc),
+                    http_host: ev.http_host,
+                    http_cookie_trunc: ev.http_cookie_trunc,
+                    http_status: ev.http_status,
                 });
             }
         }

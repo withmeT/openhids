@@ -5,3 +5,6 @@
 {"alert_kind": "bruteforce_suspected", "ts_ms": 1774072274932, "key": "192.168.4.73:22", "src_ip": "192.168.4.73", "dst_port": 22, "window_s": 30, "connection_count": 51, "threshold": 20, "service": "ssh"}
 {"alert_kind": "bruteforce_suspected", "ts_ms": 1774072286678, "key": "192.168.4.73:22", "src_ip": "192.168.4.73", "dst_port": 22, "window_s": 30, "connection_count": 71, "threshold": 20, "service": "ssh"}
 {"alert_kind": "bruteforce_suspected", "ts_ms": 1774072296899, "key": "192.168.4.73:22", "src_ip": "192.168.4.73", "dst_port": 22, "window_s": 30, "connection_count": 83, "threshold": 20, "service": "ssh"}
+{"alert_kind": "c2_beaconing_suspected", "ts_ms": 1774227841731, "key": "192.168.4.73->192.168.4.169", "src_ip": "192.168.4.73", "dst_ip": "192.168.4.169", "window_s": 300, "interval_samples": 6, "interval_stddev_ms": 0.0}
+{"alert_kind": "c2_beaconing_suspected", "ts_ms": 1774243905305, "key": "192.168.4.73->192.168.4.169", "src_ip": "192.168.4.73", "dst_ip": "192.168.4.169", "window_s": 300, "interval_samples": 6, "interval_stddev_ms": 0.0}
+{"alert_kind": "c2_beaconing_suspected", "ts_ms": 1774244427966, "key": "192.168.4.73->192.168.4.169", "src_ip": "192.168.4.73", "dst_ip": "192.168.4.169", "window_s": 300, "interval_samples": 24, "interval_stddev_ms": 195.49157679353405}

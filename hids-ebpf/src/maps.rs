@@ -27,3 +27,10 @@ pub static mut SKIP_IPS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 #[map(name = "LOCAL_IPS")]
 pub static mut LOCAL_IPS: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 
+/// XDP 需要重点关注的目标端口集合（value=1 占位）。
+#[map(name = "SENSITIVE_PORTS")]
+pub static mut SENSITIVE_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+
+/// 是否全端口采集（key 固定为 0，value=1 表示开启）。
+#[map(name = "CAPTURE_ALL_PORTS")]
+pub static mut CAPTURE_ALL_PORTS: HashMap<u8, u8> = HashMap::with_max_entries(1, 0);

@@ -5,7 +5,7 @@ use aya_ebpf::{
 
 use hids_common::FlowEvent;
 
-use crate::maps::{FLOW_EVENTS, LOCAL_IPS, SKIP_IPS};
+use crate::maps::{CAPTURE_ALL_PORTS, FLOW_EVENTS, LOCAL_IPS, SENSITIVE_PORTS, SKIP_IPS};
 
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
@@ -56,8 +56,12 @@ fn ip_is_local(ip_be: u32) -> bool {
 
 #[inline(always)]
 fn is_sensitive_port(dst_port: u16) -> bool {
-    // demo.md 默认监控端口：22、80、443、3306、6379、8080、8000
-    matches!(dst_port, 22 | 80 | 443 | 3306 | 6379 | 8080 | 8000)
+    let all_key: u8 = 0;
+    if unsafe { CAPTURE_ALL_PORTS.get_ptr(&all_key) }.is_some() {
+        return true;
+    }
+
+    unsafe { SENSITIVE_PORTS.get_ptr(&dst_port) }.is_some()
 }
 
 #[xdp]

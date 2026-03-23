@@ -20,6 +20,14 @@
   "xdp_enabled": true,
   "xdp_iface": "auto",
   "xdp_skip_ips": [],
-  "http_l7_ports": [80, 8080, 8000]
+  "xdp_capture_all_ports": false,
+  "xdp_sensitive_ports": [22, 80, 443, 3306, 6379, 8080, 8000, 9200],
+  "http_l7_ports": [80, 8080, 8000, 9200],
+
+  "http_l7_dedup_window_ms": 2000,
+  "http_l7_ignore_path_prefixes": ["/favicon.ico", "/robots.txt"],
+  "http_l7_ignore_path_suffixes": [".js", ".css", ".ico", ".woff", ".woff2", ".map"],
+
+  "http_l7_capture_response": true
 }
 

@@ -4,7 +4,7 @@ use aya_build::Toolchain;
 fn inject_build_version() -> anyhow::Result<()> {
     // Default schema version for event compatibility.
     // You can override at build time: HIDS_SCHEMA_VERSION=2 cargo build ...
-    let schema_version = std::env::var("HIDS_SCHEMA_VERSION").unwrap_or_else(|_| "1".to_string());
+    let schema_version = std::env::var("HIDS_SCHEMA_VERSION").unwrap_or_else(|_| "2".to_string());
 
     // Try to read git SHA (best-effort).
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;

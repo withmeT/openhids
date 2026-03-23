@@ -40,9 +40,25 @@ pub struct Config {
     pub xdp_iface: String,
     /// 需要跳过监听的 IPv4 地址列表（字符串形式，如 `1.2.3.4`）。
     pub xdp_skip_ips: Vec<String>,
+    /// XDP 是否采集所有目标端口（true 时忽略 `xdp_sensitive_ports`）。
+    pub xdp_capture_all_ports: bool,
+    /// XDP 重点关注的目标端口列表（仅在 `xdp_capture_all_ports=false` 时生效）。
+    pub xdp_sensitive_ports: Vec<u16>,
 
     /// 用户态 HTTP L7 采集端口（明文 HTTP）。
     pub http_l7_ports: Vec<u16>,
+
+    /// 相同五元组 + method + URL 的去重窗口（毫秒）。`0` 表示关闭去重。
+    pub http_l7_dedup_window_ms: u64,
+
+    /// 丢弃的路径前缀（降噪：静态资源等）。空列表表示不过滤前缀。
+    pub http_l7_ignore_path_prefixes: Vec<String>,
+
+    /// 丢弃的路径后缀（小写比较，降噪：`.js` / `.css` 等）。空列表表示不过滤后缀。
+    pub http_l7_ignore_path_suffixes: Vec<String>,
+
+    /// 是否嗅探本机发出的 HTTP 响应行（用于解析状态码）；关闭可减少出站方向处理。
+    pub http_l7_capture_response: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -68,7 +84,15 @@ struct PartialConfig {
     xdp_enabled: Option<bool>,
     xdp_iface: Option<String>,
     xdp_skip_ips: Option<Vec<String>>,
+    xdp_capture_all_ports: Option<bool>,
+    xdp_sensitive_ports: Option<Vec<u16>>,
     http_l7_ports: Option<Vec<u16>>,
+
+    http_l7_dedup_window_ms: Option<u64>,
+    http_l7_ignore_path_prefixes: Option<Vec<String>>,
+    http_l7_ignore_path_suffixes: Option<Vec<String>>,
+
+    http_l7_capture_response: Option<bool>,
 }
 
 impl Config {
@@ -95,7 +119,25 @@ impl Config {
             xdp_enabled: true,
             xdp_iface: "auto".to_string(),
             xdp_skip_ips: Vec::new(),
-            http_l7_ports: vec![80, 8080, 8000],
+            xdp_capture_all_ports: false,
+            xdp_sensitive_ports: vec![22, 80, 443, 3306, 6379, 8080, 8000, 9200],
+            http_l7_ports: vec![80, 8080, 8000, 9200],
+
+            http_l7_dedup_window_ms: 2_000,
+            http_l7_ignore_path_prefixes: vec![
+                "/favicon.ico".to_string(),
+                "/robots.txt".to_string(),
+            ],
+            http_l7_ignore_path_suffixes: vec![
+                ".js".to_string(),
+                ".css".to_string(),
+                ".ico".to_string(),
+                ".woff".to_string(),
+                ".woff2".to_string(),
+                ".map".to_string(),
+            ],
+
+            http_l7_capture_response: true,
         };
 
         // Optional config file (JSON)
@@ -157,6 +199,23 @@ impl Config {
                 .collect();
         }
 
+        cfg.xdp_capture_all_ports = std::env::var("HIDS_XDP_CAPTURE_ALL_PORTS")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.xdp_capture_all_ports);
+
+        if let Ok(v) = std::env::var("HIDS_XDP_SENSITIVE_PORTS") {
+            let mut ports = Vec::new();
+            for p in v.split(',') {
+                if let Ok(pp) = p.trim().parse::<u16>() {
+                    ports.push(pp);
+                }
+            }
+            if !ports.is_empty() {
+                cfg.xdp_sensitive_ports = ports;
+            }
+        }
+
         // env: HIDS_HTTP_L7_PORTS=80,8080,8000
         if let Ok(v) = std::env::var("HIDS_HTTP_L7_PORTS") {
             let mut ports = Vec::new();
@@ -169,6 +228,38 @@ impl Config {
                 cfg.http_l7_ports = ports;
             }
         }
+
+        cfg.http_l7_dedup_window_ms = parse_env_u64("HIDS_HTTP_L7_DEDUP_WINDOW_MS")
+            .unwrap_or(cfg.http_l7_dedup_window_ms);
+
+        // 分号分隔的路径前缀，例如 `/favicon.ico;/static/`
+        if let Ok(v) = std::env::var("HIDS_HTTP_L7_IGNORE_PREFIXES") {
+            let mut pfx = Vec::new();
+            for s in v.split(';') {
+                let t = s.trim();
+                if !t.is_empty() {
+                    pfx.push(t.to_string());
+                }
+            }
+            cfg.http_l7_ignore_path_prefixes = pfx;
+        }
+
+        // 分号分隔的后缀，例如 `.js;.css;.map`
+        if let Ok(v) = std::env::var("HIDS_HTTP_L7_IGNORE_SUFFIXES") {
+            let mut sfx = Vec::new();
+            for s in v.split(';') {
+                let t = s.trim();
+                if !t.is_empty() {
+                    sfx.push(t.to_string());
+                }
+            }
+            cfg.http_l7_ignore_path_suffixes = sfx;
+        }
+
+        cfg.http_l7_capture_response = std::env::var("HIDS_HTTP_L7_CAPTURE_RESPONSE")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.http_l7_capture_response);
 
         Ok(cfg)
     }
@@ -217,8 +308,28 @@ impl Config {
         if let Some(v) = partial.xdp_skip_ips {
             self.xdp_skip_ips = v;
         }
+        if let Some(v) = partial.xdp_capture_all_ports {
+            self.xdp_capture_all_ports = v;
+        }
+        if let Some(v) = partial.xdp_sensitive_ports {
+            self.xdp_sensitive_ports = v;
+        }
         if let Some(v) = partial.http_l7_ports {
             self.http_l7_ports = v;
+        }
+
+        if let Some(v) = partial.http_l7_dedup_window_ms {
+            self.http_l7_dedup_window_ms = v;
+        }
+        if let Some(v) = partial.http_l7_ignore_path_prefixes {
+            self.http_l7_ignore_path_prefixes = v;
+        }
+        if let Some(v) = partial.http_l7_ignore_path_suffixes {
+            self.http_l7_ignore_path_suffixes = v;
+        }
+
+        if let Some(v) = partial.http_l7_capture_response {
+            self.http_l7_capture_response = v;
         }
     }
 }
