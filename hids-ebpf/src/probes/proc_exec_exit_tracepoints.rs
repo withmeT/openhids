@@ -1,10 +1,13 @@
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_probe_read_user_str_bytes,
+    },
     macros::tracepoint,
     programs::TracePointContext,
 };
 
-use hids_common::{COMM_LEN, ExecEvent, ExitEvent};
+use hids_common::{COMM_LEN, ExecEvent, ExitEvent, MAX_EXEC_PATH};
 
 use crate::maps::{EXEC_EVENTS, EXIT_EVENTS};
 
@@ -24,7 +27,7 @@ pub fn trace_enter_execve(ctx: TracePointContext) -> u32 {
     }
 }
 
-unsafe fn try_enter_execve(_ctx: TracePointContext) -> Result<(), i64> {
+unsafe fn try_enter_execve(ctx: TracePointContext) -> Result<(), i64> {
     let (pid, tgid) = get_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let uid = (uid_gid & 0xffff_ffff) as u32;
@@ -45,6 +48,18 @@ unsafe fn try_enter_execve(_ctx: TracePointContext) -> Result<(), i64> {
         (*ev).tgid = tgid;
         (*ev).uid = uid;
         core::ptr::copy_nonoverlapping(comm.as_ptr(), (*ev).comm.as_mut_ptr(), COMM_LEN);
+        (*ev).filename = [0u8; MAX_EXEC_PATH];
+        (*ev).filename_len = 0;
+
+        // trace_event_raw_sys_enter_execve: `const char * filename` at offset 16 (x86_64).
+        let filename_ptr: u64 = ctx.read_at::<u64>(16)?;
+        if filename_ptr != 0 {
+            let buf =
+                core::slice::from_raw_parts_mut((*ev).filename.as_mut_ptr(), MAX_EXEC_PATH);
+            if let Ok(b) = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, buf) {
+                (*ev).filename_len = b.len() as u32;
+            }
+        }
     }
 
     entry.submit(0);

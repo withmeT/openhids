@@ -1,7 +1,7 @@
 {
   "host_id": null,
 
-  "ingest_url": "http://127.0.0.1:8000/ingest",
+  "ingest_url": "http://127.0.0.1:8899/ingest",
 
   "flush_bytes": 1048576,
   "flush_interval_ms": 2000,

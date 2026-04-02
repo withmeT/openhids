@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// 单条从 eBPF ringbuf 拉取到用户态的“命令事件”，随后会被 batch/压缩后发送到接收端。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
-    /// 事件类型：0=命令输入，1=命令执行结果，2=flow，3=HTTP L7（请求或响应线索）
+    /// 事件类型：0=bash 命令行，1=预留，2=flow，3=HTTP L7，4=execve，5=进程退出，6=文件变更
     pub event_kind: u8,
     pub ts_ms: u64,
     pub uid: u32,
@@ -61,6 +61,18 @@ pub struct AgentEvent {
     /// 响应状态码（仅当嗅探到 `HTTP/1.x` 响应行时填充；请求事件为 None）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+
+    /// event_kind=4：`execve` 的可执行路径（自 `sys_enter_execve.filename`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_path: Option<String>,
+
+    /// event_kind=6：被监控路径下的文件路径。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+
+    /// event_kind=6：变更类型（如 create / modify / remove / rename / other）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_op: Option<String>,
 }
 
 /// 一次 HTTP 发送的“批次包裹层”，用于携带版本信息并保持事件数组不变。

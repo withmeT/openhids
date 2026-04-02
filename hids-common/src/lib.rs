@@ -2,6 +2,8 @@
 
 pub const COMM_LEN: usize = 16;
 pub const MAX_LINE: usize = 256;
+/// `execve` 路径缓冲（与 eBPF / 用户态 ABI 一致）。
+pub const MAX_EXEC_PATH: usize = 256;
 
 /// Bash 命令行捕获事件（用于从 eBPF 上报到用户态）。
 ///
@@ -24,7 +26,7 @@ pub struct CommandEvent {
     pub len: u32,
 }
 
-/// execve（进程启动）事件，用于将 bash 输入的命令与其子进程关联。
+/// execve（进程启动）事件：含可执行文件路径（从 `sys_enter_execve` 的 `filename` 指针读取）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ExecEvent {
@@ -36,6 +38,10 @@ pub struct ExecEvent {
     pub uid: u32,
     /// 当前进程名（comm），16 字节
     pub comm: [u8; COMM_LEN],
+    /// `execve` 的 `filename` 字符串（NUL 结尾；不足部分为 0）
+    pub filename: [u8; MAX_EXEC_PATH],
+    /// `filename` 有效长度（含 NUL 时取决于 helper 返回值）
+    pub filename_len: u32,
 }
 
 /// 进程退出事件（exit/exit_group），携带 exit code。

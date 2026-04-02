@@ -59,6 +59,12 @@ pub struct Config {
 
     /// 是否嗅探本机发出的 HTTP 响应行（用于解析状态码）；关闭可减少出站方向处理。
     pub http_l7_capture_response: bool,
+
+    /// 是否启用 `execve` / `exit` tracepoint（进程创建与退出）。
+    pub proc_monitor_enabled: bool,
+
+    /// 文件监控路径（非空则启用 inotify 类监听）；建议配置关键目录如 `/etc`、`/var/www`。
+    pub file_watch_paths: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -93,6 +99,9 @@ struct PartialConfig {
     http_l7_ignore_path_suffixes: Option<Vec<String>>,
 
     http_l7_capture_response: Option<bool>,
+
+    proc_monitor_enabled: Option<bool>,
+    file_watch_paths: Option<Vec<String>>,
 }
 
 impl Config {
@@ -138,6 +147,9 @@ impl Config {
             ],
 
             http_l7_capture_response: true,
+
+            proc_monitor_enabled: true,
+            file_watch_paths: Vec::new(),
         };
 
         // Optional config file (JSON)
@@ -261,6 +273,25 @@ impl Config {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(cfg.http_l7_capture_response);
 
+        cfg.proc_monitor_enabled = std::env::var("HIDS_PROC_MONITOR_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.proc_monitor_enabled);
+
+        // HIDS_FILE_WATCH_PATHS=/etc;/var/www 分号分隔
+        if let Ok(v) = std::env::var("HIDS_FILE_WATCH_PATHS") {
+            let mut paths = Vec::new();
+            for s in v.split(';') {
+                let t = s.trim();
+                if !t.is_empty() {
+                    paths.push(t.to_string());
+                }
+            }
+            if !paths.is_empty() {
+                cfg.file_watch_paths = paths;
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -330,6 +361,13 @@ impl Config {
 
         if let Some(v) = partial.http_l7_capture_response {
             self.http_l7_capture_response = v;
+        }
+
+        if let Some(v) = partial.proc_monitor_enabled {
+            self.proc_monitor_enabled = v;
+        }
+        if let Some(v) = partial.file_watch_paths {
+            self.file_watch_paths = v;
         }
     }
 }

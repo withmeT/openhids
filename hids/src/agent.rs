@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
     sync::{mpsc, Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -8,7 +9,7 @@ use anyhow::Context as _;
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::RingBuf;
 use aya::maps::HashMap as AyaHashMap;
-use aya::programs::{UProbe, Xdp, XdpFlags};
+use aya::programs::{TracePoint, UProbe, Xdp, XdpFlags};
 use pnet_datalink::{self, Channel, Config as DatalinkConfig};
 use pnet_packet::Packet;
 use pnet_packet::ethernet::{EtherTypes, EthernetPacket};
@@ -20,12 +21,13 @@ use crate::{
     batcher::Batcher,
     config::Config,
     events::{AgentEvent, IngestEnvelope},
+    features::file_change::{self, FileWatchEvent},
     http_client::drain_spool,
     spool::Spool,
     utils::cstr_from_fixed,
 };
 
-use hids_common::{CommandEvent, FlowEvent};
+use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent};
 
 fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
     let mut it = s.split('.');
