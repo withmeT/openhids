@@ -148,7 +148,8 @@ impl Config {
 
             http_l7_capture_response: true,
 
-            proc_monitor_enabled: true,
+            // 默认关闭：exec/exit 事件量极大，生产请按需开启或通过 JSON/env 打开。
+            proc_monitor_enabled: false,
             file_watch_paths: Vec::new(),
         };
 

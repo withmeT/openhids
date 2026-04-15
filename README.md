@@ -1,6 +1,7 @@
 # hids
 
-各源码文件职责说明见 **[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)**。
+各源码文件职责说明见 **[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)**。  
+**监测架构（eBPF 探针、RingBuf、XDP 行为、事件类型）**见 **[MONITORING.md](./MONITORING.md)**。
 
 ## Prerequisites
 
@@ -96,6 +97,8 @@ Agent 默认以 **root** 运行（`sudo ./target/release/hids`），典型需求
 - `HIDS_HTTP_L7_CAPTURE_RESPONSE=true|false`（P2：是否解析本机发出的 HTTP 响应状态码）
 - `HIDS_XDP_CAPTURE_ALL_PORTS=true|false`（XDP 是否全端口采集；开启后事件量会明显增加）
 - `HIDS_XDP_SENSITIVE_PORTS=22,80,443,3306,6379,8080,8000,9200`（仅在 `HIDS_XDP_CAPTURE_ALL_PORTS=false` 时生效）
+- `HIDS_PROC_MONITOR_ENABLED=true|false`（eBPF **execve / exit** tracepoint，`event_kind` 为 **4** / **5**；事件量很大，默认 `false`，建议在 `hids-agent.json` 按需开启）
+- `HIDS_FILE_WATCH_PATHS=/etc;/var/www`（用户态 **inotify** 类目录监听，`event_kind=6`；与 exec/exit、XDP 一样需在**启动时**根据配置初始化）
 
 ## Cross-compiling on macOS
 

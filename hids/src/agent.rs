@@ -27,7 +27,7 @@ use crate::{
     utils::cstr_from_fixed,
 };
 
-use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent};
+use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent, MAX_EXEC_PATH};
 
 fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
     let mut it = s.split('.');
@@ -39,6 +39,67 @@ fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
         return None;
     }
     Some((a << 24) | (b << 16) | (c << 8) | d)
+}
+
+/// 生成除 `event_kind` / 身份字段外均为空的 `AgentEvent`，减少重复字段。
+fn base_event(
+    event_kind: u8,
+    ts_ms: u64,
+    uid: u32,
+    tgid: u32,
+    pid: u32,
+    comm: impl Into<String>,
+) -> AgentEvent {
+    AgentEvent {
+        event_kind,
+        ts_ms,
+        uid,
+        tgid,
+        pid,
+        comm: comm.into(),
+        line: None,
+        exit_code: None,
+        success: None,
+        flow_correlation_key: None,
+        flow_src_ip: None,
+        flow_dst_ip: None,
+        flow_src_port: None,
+        flow_dst_port: None,
+        flow_proto: None,
+        flow_tcp_flags: None,
+        flow_direction: None,
+        flow_is_sensitive_port: None,
+        flow_payload_len: None,
+        http_payload_trunc: None,
+        http_trunc_len: None,
+        http_method: None,
+        http_url: None,
+        http_body_trunc: None,
+        http_host: None,
+        http_cookie_trunc: None,
+        http_status: None,
+        exec_path: None,
+        file_path: None,
+        file_op: None,
+    }
+}
+
+fn exec_filename_to_string(buf: &[u8], reported_len: u32) -> String {
+    if reported_len == 0 {
+        return String::new();
+    }
+    let n = (reported_len as usize).min(buf.len()).min(MAX_EXEC_PATH);
+    let slice = &buf[..n];
+    let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let mut out = String::with_capacity(end.min(512));
+    for ch in String::from_utf8_lossy(&slice[..end]).chars().take(512) {
+        if ch.is_ascii_graphic() || ch == ' ' || ch == '/' {
+            out.push(ch);
+        } else {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
 }
 
 fn be_u32_to_ipv4_str(ip_be: u32) -> String {
@@ -479,6 +540,45 @@ pub async fn run() -> Result<(), anyhow::Error> {
         .context("map EVENTS not found")?;
     let mut ringbuf_cmd = RingBuf::try_from(events_map)?;
 
+    let mut ringbuf_exec = None;
+    let mut ringbuf_exit = None;
+    if cfg.proc_monitor_enabled {
+        const TP: &[(&str, &str, &str)] = &[
+            ("trace_enter_execve", "syscalls", "sys_enter_execve"),
+            ("trace_enter_exit", "syscalls", "sys_enter_exit"),
+            ("trace_enter_exit_group", "syscalls", "sys_enter_exit_group"),
+        ];
+        for &(prog, cat, name) in TP {
+            let program: &mut TracePoint = bpf
+                .program_mut(prog)
+                .with_context(|| format!("program {prog} not found"))?
+                .try_into()
+                .with_context(|| format!("program {prog} is not a TracePoint"))?;
+            program.load().with_context(|| format!("load {prog}"))?;
+            program
+                .attach(cat, name)
+                .with_context(|| format!("attach {prog} -> {cat}/{name}"))?;
+        }
+        println!("Attached tracepoints: execve, exit, exit_group (proc monitor).");
+
+        let exec_map = bpf
+            .take_map("EXEC_EVENTS")
+            .context("map EXEC_EVENTS not found")?;
+        ringbuf_exec = Some(RingBuf::try_from(exec_map)?);
+
+        let exit_map = bpf
+            .take_map("EXIT_EVENTS")
+            .context("map EXIT_EVENTS not found")?;
+        ringbuf_exit = Some(RingBuf::try_from(exit_map)?);
+    }
+
+    let file_watch_rx = if !cfg.file_watch_paths.is_empty() {
+        let paths: Vec<PathBuf> = cfg.file_watch_paths.iter().map(PathBuf::from).collect();
+        file_change::spawn_file_watcher(paths)
+    } else {
+        None
+    };
+
     // XDP flow collection (five tuple)
     let mut ringbuf_flow = None;
     let mut http_l7_rx: Option<mpsc::Receiver<HttpL7Event>> = None;
@@ -651,35 +751,38 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let line = cstr_from_fixed(&ev.line);
             let ts_ms = now_ms;
 
-            batcher.push(AgentEvent {
-                event_kind: 0,
-                ts_ms,
-                uid: ev.uid,
-                tgid: ev.tgid,
-                pid: ev.pid,
-                comm,
-                line: Some(line),
-                exit_code: None,
-                success: None,
-                flow_correlation_key: None,
-                flow_src_ip: None,
-                flow_dst_ip: None,
-                flow_src_port: None,
-                flow_dst_port: None,
-                flow_proto: None,
-                flow_tcp_flags: None,
-                flow_direction: None,
-                flow_is_sensitive_port: None,
-                flow_payload_len: None,
-                http_payload_trunc: None,
-                http_trunc_len: None,
-                http_method: None,
-                http_url: None,
-                http_body_trunc: None,
-                http_host: None,
-                http_cookie_trunc: None,
-                http_status: None,
-            });
+            let mut ae = base_event(0, ts_ms, ev.uid, ev.tgid, ev.pid, comm);
+            ae.line = Some(line);
+            batcher.push(ae);
+        }
+
+        if let Some(rb) = ringbuf_exec.as_mut() {
+            while let Some(item) = rb.next() {
+                if item.len() < core::mem::size_of::<ExecEvent>() {
+                    continue;
+                }
+                let ptr = item.as_ptr() as *const ExecEvent;
+                let ev = unsafe { core::ptr::read_unaligned(ptr) };
+                let comm = cstr_from_fixed(&ev.comm);
+                let path = exec_filename_to_string(&ev.filename, ev.filename_len);
+                let mut ae = base_event(4, now_ms, ev.uid, ev.tgid, ev.pid, comm);
+                ae.exec_path = Some(path);
+                batcher.push(ae);
+            }
+        }
+
+        if let Some(rb) = ringbuf_exit.as_mut() {
+            while let Some(item) = rb.next() {
+                if item.len() < core::mem::size_of::<ExitEvent>() {
+                    continue;
+                }
+                let ptr = item.as_ptr() as *const ExitEvent;
+                let ev = unsafe { core::ptr::read_unaligned(ptr) };
+                let comm = cstr_from_fixed(&ev.comm);
+                let mut ae = base_event(5, now_ms, ev.uid, ev.tgid, ev.pid, comm);
+                ae.exit_code = Some(ev.exit_code);
+                batcher.push(ae);
+            }
         }
 
         // read flow events (fast)
@@ -696,35 +799,18 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 let d_ip = be_u32_to_ipv4_str(ev.dst_ip);
                 let flow_key = tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
 
-                batcher.push(AgentEvent {
-                    event_kind: 2,
-                    ts_ms: now_ms,
-                    uid: 0,
-                    tgid: 0,
-                    pid: 0,
-                    comm: "xdp".to_string(),
-                    line: None,
-                    exit_code: None,
-                    success: None,
-                    flow_correlation_key: Some(flow_key),
-                    flow_src_ip: Some(s_ip),
-                    flow_dst_ip: Some(d_ip),
-                    flow_src_port: Some(ev.src_port),
-                    flow_dst_port: Some(ev.dst_port),
-                    flow_proto: Some(ev.proto),
-                    flow_tcp_flags: Some(ev.tcp_flags),
-                    flow_direction: Some(ev.direction),
-                    flow_is_sensitive_port: Some(ev.is_sensitive_port != 0),
-                    flow_payload_len: Some(ev.payload_len),
-                    http_payload_trunc: None,
-                    http_trunc_len: None,
-                    http_method: None,
-                    http_url: None,
-                    http_body_trunc: None,
-                    http_host: None,
-                    http_cookie_trunc: None,
-                    http_status: None,
-                });
+                let mut ae = base_event(2, now_ms, 0, 0, 0, "xdp".to_string());
+                ae.flow_correlation_key = Some(flow_key);
+                ae.flow_src_ip = Some(s_ip);
+                ae.flow_dst_ip = Some(d_ip);
+                ae.flow_src_port = Some(ev.src_port);
+                ae.flow_dst_port = Some(ev.dst_port);
+                ae.flow_proto = Some(ev.proto);
+                ae.flow_tcp_flags = Some(ev.tcp_flags);
+                ae.flow_direction = Some(ev.direction);
+                ae.flow_is_sensitive_port = Some(ev.is_sensitive_port != 0);
+                ae.flow_payload_len = Some(ev.payload_len);
+                batcher.push(ae);
             }
         }
 
@@ -765,43 +851,40 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     tcp_flow_correlation_key(&ev.src_ip, ev.src_port, &ev.dst_ip, ev.dst_port)
                 };
 
-                batcher.push(AgentEvent {
-                    event_kind: 3,
-                    ts_ms: now_ms,
-                    uid: 0,
-                    tgid: 0,
-                    pid: 0,
-                    comm: "http_l7".to_string(),
-                    line: None,
-                    exit_code: None,
-                    success: None,
-                    flow_correlation_key: Some(flow_key),
-                    flow_src_ip: Some(ev.src_ip),
-                    flow_dst_ip: Some(ev.dst_ip),
-                    flow_src_port: Some(ev.src_port),
-                    flow_dst_port: Some(ev.dst_port),
-                    flow_proto: Some(6),
-                    flow_tcp_flags: None,
-                    flow_direction: Some(if ev.is_response { 2 } else { 1 }),
-                    flow_is_sensitive_port: Some(true),
-                    flow_payload_len: None,
-                    http_payload_trunc: None,
-                    http_trunc_len: Some(200),
-                    http_method: if ev.is_response {
-                        None
-                    } else {
-                        Some(ev.method)
-                    },
-                    http_url: if ev.is_response {
-                        None
-                    } else {
-                        Some(ev.url)
-                    },
-                    http_body_trunc: Some(ev.body_trunc),
-                    http_host: ev.http_host,
-                    http_cookie_trunc: ev.http_cookie_trunc,
-                    http_status: ev.http_status,
-                });
+                let mut ae = base_event(3, now_ms, 0, 0, 0, "http_l7".to_string());
+                ae.flow_correlation_key = Some(flow_key);
+                ae.flow_src_ip = Some(ev.src_ip);
+                ae.flow_dst_ip = Some(ev.dst_ip);
+                ae.flow_src_port = Some(ev.src_port);
+                ae.flow_dst_port = Some(ev.dst_port);
+                ae.flow_proto = Some(6);
+                ae.flow_direction = Some(if ev.is_response { 2 } else { 1 });
+                ae.flow_is_sensitive_port = Some(true);
+                ae.http_trunc_len = Some(200);
+                ae.http_method = if ev.is_response {
+                    None
+                } else {
+                    Some(ev.method)
+                };
+                ae.http_url = if ev.is_response {
+                    None
+                } else {
+                    Some(ev.url)
+                };
+                ae.http_body_trunc = Some(ev.body_trunc);
+                ae.http_host = ev.http_host;
+                ae.http_cookie_trunc = ev.http_cookie_trunc;
+                ae.http_status = ev.http_status;
+                batcher.push(ae);
+            }
+        }
+
+        if let Some(fw_rx) = file_watch_rx.as_ref() {
+            while let Ok(ev) = fw_rx.try_recv() {
+                let mut ae = base_event(6, now_ms, 0, 0, 0, "file_watch".to_string());
+                ae.file_path = Some(ev.path);
+                ae.file_op = Some(ev.op);
+                batcher.push(ae);
             }
         }
 

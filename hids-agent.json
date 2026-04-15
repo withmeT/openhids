@@ -20,6 +20,8 @@
   "xdp_enabled": true,
   "xdp_iface": "auto",
   "xdp_skip_ips": ["3.212.233.16","100.30.3.244"],
+  "xdp_capture_all_ports": false,
+  "xdp_sensitive_ports": [22, 80, 443, 3306, 6379, 8080, 8000, 9200],
   "http_l7_ports": [80, 8080, 8000, 9200],
 
   "http_l7_dedup_window_ms": 2000,
