@@ -21,13 +21,13 @@ use crate::{
     batcher::Batcher,
     config::Config,
     events::{AgentEvent, IngestEnvelope},
-    features::file_change::{self, FileWatchEvent},
+    features::file_change,
     http_client::drain_spool,
     spool::Spool,
     utils::cstr_from_fixed,
 };
 
-use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent, MAX_EXEC_PATH};
+use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent, TlsEvent, MAX_EXEC_PATH};
 
 fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
     let mut it = s.split('.');
@@ -81,6 +81,9 @@ fn base_event(
         exec_path: None,
         file_path: None,
         file_op: None,
+        tls_direction: None,
+        tls_payload_trunc: None,
+        tls_threat: None,
     }
 }
 
@@ -100,6 +103,54 @@ fn exec_filename_to_string(buf: &[u8], reported_len: u32) -> String {
         }
     }
     out.trim().to_string()
+}
+
+fn detect_libssl_path(cfg_path: &str) -> Option<String> {
+    if !cfg_path.trim().is_empty() && cfg_path != "auto" && std::path::Path::new(cfg_path).exists()
+    {
+        return Some(cfg_path.to_string());
+    }
+
+    let out = std::process::Command::new("ldconfig").args(["-p"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if !line.contains("libssl.so") {
+            continue;
+        }
+        if let Some((_, p)) = line.split_once("=>") {
+            let path = p.trim();
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn payload_hits_target_port(payload: &str, port: u16) -> bool {
+    let token = format!(":{port}");
+    payload.contains(&token)
+}
+
+fn detect_sqli_keyword(payload_lc: &str) -> Option<String> {
+    const SQLI_PATS: &[&str] = &[
+        "union select",
+        " or 1=1",
+        "' or '1'='1",
+        "sleep(",
+        "benchmark(",
+        "information_schema",
+        "select ",
+    ];
+    for p in SQLI_PATS {
+        if payload_lc.contains(p) {
+            return Some("sqli_keyword".to_string());
+        }
+    }
+    None
 }
 
 fn be_u32_to_ipv4_str(ip_be: u32) -> String {
@@ -540,6 +591,48 @@ pub async fn run() -> Result<(), anyhow::Error> {
         .context("map EVENTS not found")?;
     let mut ringbuf_cmd = RingBuf::try_from(events_map)?;
 
+    let mut ringbuf_tls = None;
+    if cfg.tls_monitor_enabled {
+        let libssl_path = detect_libssl_path(&cfg.tls_libssl_path)
+            .ok_or_else(|| anyhow::anyhow!("libssl path not found; set tls_libssl_path"))?;
+
+        let ssl_write_prog: &mut UProbe = bpf
+            .program_mut("uprobe_ssl_write")
+            .context("program uprobe_ssl_write not found")?
+            .try_into()?;
+        ssl_write_prog.load().context("load uprobe_ssl_write")?;
+        ssl_write_prog
+            .attach("SSL_write", &libssl_path, None)
+            .with_context(|| format!("attach SSL_write to {libssl_path}"))?;
+
+        let ssl_read_prog: &mut UProbe = bpf
+            .program_mut("uretprobe_ssl_read")
+            .context("program uretprobe_ssl_read not found")?
+            .try_into()?;
+        ssl_read_prog.load().context("load uretprobe_ssl_read")?;
+        ssl_read_prog
+            .attach("SSL_read", &libssl_path, None)
+            .with_context(|| format!("attach SSL_read to {libssl_path}"))?;
+
+        let ssl_read_enter_prog: &mut UProbe = bpf
+            .program_mut("uprobe_ssl_read_enter")
+            .context("program uprobe_ssl_read_enter not found")?
+            .try_into()?;
+        ssl_read_enter_prog
+            .load()
+            .context("load uprobe_ssl_read_enter")?;
+        ssl_read_enter_prog
+            .attach("SSL_read", &libssl_path, None)
+            .with_context(|| format!("attach SSL_read(entry) to {libssl_path}"))?;
+
+        let tls_map = bpf.take_map("TLS_EVENTS").context("map TLS_EVENTS not found")?;
+        ringbuf_tls = Some(RingBuf::try_from(tls_map)?);
+        println!(
+            "Attached TLS uprobes on {} (target_comm='{}' target_port={})",
+            libssl_path, cfg.tls_target_comm, cfg.tls_target_port
+        );
+    }
+
     let mut ringbuf_exec = None;
     let mut ringbuf_exit = None;
     if cfg.proc_monitor_enabled {
@@ -722,6 +815,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 cfg.http_l7_ignore_path_suffixes = new_cfg.http_l7_ignore_path_suffixes.clone();
                 cfg.http_l7_ports = new_cfg.http_l7_ports.clone();
                 cfg.http_l7_capture_response = new_cfg.http_l7_capture_response;
+                cfg.tls_target_comm = new_cfg.tls_target_comm.clone();
+                cfg.tls_target_port = new_cfg.tls_target_port;
 
                 cfg.host_id = new_cfg.host_id;
 
@@ -781,6 +876,46 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 let comm = cstr_from_fixed(&ev.comm);
                 let mut ae = base_event(5, now_ms, ev.uid, ev.tgid, ev.pid, comm);
                 ae.exit_code = Some(ev.exit_code);
+                batcher.push(ae);
+            }
+        }
+
+        if let Some(rb) = ringbuf_tls.as_mut() {
+            while let Some(item) = rb.next() {
+                if item.len() < core::mem::size_of::<TlsEvent>() {
+                    continue;
+                }
+                let ptr = item.as_ptr() as *const TlsEvent;
+                let ev = unsafe { core::ptr::read_unaligned(ptr) };
+                let comm = cstr_from_fixed(&ev.comm);
+                if !cfg.tls_target_comm.is_empty() && !comm.contains(&cfg.tls_target_comm) {
+                    continue;
+                }
+
+                let n = (ev.len as usize).min(ev.data.len());
+                if n == 0 {
+                    continue;
+                }
+                let payload_raw = String::from_utf8_lossy(&ev.data[..n]).to_string();
+                if !payload_hits_target_port(&payload_raw, cfg.tls_target_port) {
+                    continue;
+                }
+
+                let payload_lc = payload_raw.to_ascii_lowercase();
+                let is_post = payload_lc.contains("post ");
+                let threat = detect_sqli_keyword(&payload_lc);
+                if !is_post && threat.is_none() {
+                    continue;
+                }
+
+                let mut ae = base_event(7, now_ms, ev.uid, ev.tgid, ev.pid, comm);
+                ae.tls_direction = Some(if ev.direction == 1 {
+                    "ssl_read".to_string()
+                } else {
+                    "ssl_write".to_string()
+                });
+                ae.tls_payload_trunc = Some(sanitize_text_200(&payload_raw));
+                ae.tls_threat = threat;
                 batcher.push(ae);
             }
         }

@@ -16,7 +16,7 @@
 | `README.md`               | 构建运行、校验、权限、路线图（P1/P2/P3）、配置说明。                                   |
 | `MONITORING.md`           | **监测架构**：eBPF 与 `event_kind`、Maps、XDP 逻辑、用户态补充、运维建议。                    |
 | `LICENSE-*`               | 许可证：用户态双许可；eBPF 代码 GPL2/MIT 可选。                                  |
-| `hids-agent.json.example` | Agent JSON 配置示例（ingest、flush、XDP、HTTP L7、P1/P2 等）。               |
+| `hids-agent.json.example` | Agent JSON 配置示例（ingest、XDP、HTTP L7、exec/exit、TLS 明文观测等）。      |
 | `hids-agent.json`         | 本地运行时配置（若存在；默认路径可被 `HIDS_CONFIG_PATH` 覆盖）。**通常不提交含密钥的真实文件。**     |
 
 
@@ -67,6 +67,7 @@
 | `hids-ebpf/src/maps.rs`                              | eBPF **maps**：RingBuf（命令、exec、exit、flow）、SKIP_IPS、LOCAL_IPS、SENSITIVE_PORTS 等。 |
 | `hids-ebpf/src/probes/mod.rs`                        | 探针子模块声明。                                                                   |
 | `hids-ebpf/src/probes/readline_uretprobe.rs`         | 对 `/bin/bash` `readline` 的 **uretprobe**：将命令行写入 RingBuf（`CommandEvent`）。   |
+| `hids-ebpf/src/probes/tls_ssl_uprobes.rs`            | OpenSSL `SSL_write`/`SSL_read` uprobe/uretprobe：输出 TLS 明文截断（测试场景）。 |
 | `hids-ebpf/src/probes/xdp_flow5tuple.rs`             | **XDP**：解析 IPv4 TCP，**入站**敏感端口 **SYN** 上报 `FlowEvent`，全程 **XDP_PASS** 不丢包。 |
 | `hids-ebpf/src/probes/proc_exec_exit_tracepoints.rs` | **tracepoint**：`sys_enter_execve`、`sys_enter_exit` / `exit_group`，写入 `EXEC_EVENTS` / `EXIT_EVENTS`。 |
 

@@ -99,6 +99,21 @@ Agent 默认以 **root** 运行（`sudo ./target/release/hids`），典型需求
 - `HIDS_XDP_SENSITIVE_PORTS=22,80,443,3306,6379,8080,8000,9200`（仅在 `HIDS_XDP_CAPTURE_ALL_PORTS=false` 时生效）
 - `HIDS_PROC_MONITOR_ENABLED=true|false`（eBPF **execve / exit** tracepoint，`event_kind` 为 **4** / **5**；事件量很大，默认 `false`，建议在 `hids-agent.json` 按需开启）
 - `HIDS_FILE_WATCH_PATHS=/etc;/var/www`（用户态 **inotify** 类目录监听，`event_kind=6`；与 exec/exit、XDP 一样需在**启动时**根据配置初始化）
+- `HIDS_TLS_MONITOR_ENABLED=true|false`（OpenSSL `SSL_write`/`SSL_read` 明文观测，`event_kind=7`）
+- `HIDS_TLS_LIBSSL_PATH=auto|/path/to/libssl.so.3`（TLS uprobe 目标库）
+- `HIDS_TLS_TARGET_COMM=nginx`（仅保留进程名包含该关键字的 TLS 事件）
+- `HIDS_TLS_TARGET_PORT=18888`（仅保留 Host 头含 `:18888` 的 TLS 明文 HTTP 事件，便于你当前 nginx HTTPS 测试）
+
+### HTTPS 明文测试（nginx:18888）
+
+1. 在 `hids-agent.json` 中开启：
+   - `tls_monitor_enabled=true`
+   - `tls_target_comm=\"nginx\"`
+   - `tls_target_port=18888`
+2. 启动 agent（需要 root）。
+3. 发起测试请求（含 SQLi 关键字）：
+   - `curl -k -X POST "https://127.0.0.1:18888/login" -d "id=1' UNION SELECT 1,2,3--"`
+4. 预期：接收端出现 `event_kind=7`，并带 `tls_payload_trunc`；若命中关键词则 `tls_threat=sqli_keyword`。
 
 ## Cross-compiling on macOS
 

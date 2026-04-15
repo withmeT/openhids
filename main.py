@@ -399,11 +399,23 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-        print(
-            f"[{time.strftime('%F %T')}] received batches=1 items={len(items)} bytes={len(raw)} alerts={len(alerts)}",
-            flush=True,
-        )
-        if alerts:
+        # 只打印 HTTPS/TLS 明文相关日志（event_kind=7），其他事件不在控制台输出。
+        https_items = [
+            it for it in items
+            if isinstance(it, dict) and _safe_int(it.get("event_kind"), -1) == 7
+        ]
+        if https_items:
+            print(
+                f"[{time.strftime('%F %T')}] https_items={len(https_items)} bytes={len(raw)}",
+                flush=True,
+            )
+            first = https_items[0]
+            print(
+                f"  https_first={{'comm': {first.get('comm')!r}, 'tls_direction': {first.get('tls_direction')!r}, "
+                f"'tls_threat': {first.get('tls_threat')!r}, 'tls_payload_trunc': {first.get('tls_payload_trunc')!r}}}",
+                flush=True,
+            )
+        if alerts and https_items:
             print(f"  alert_first={alerts[0]}", flush=True)
 
         self._send(200, {"ok": True, "received": len(items), "alerts": len(alerts), "ts": time.time()})
@@ -414,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     host = "127.0.0.1"
-    port = 8000
+    port = 8899
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"listening on http://{host}:{port}/ingest", flush=True)
     httpd.serve_forever()

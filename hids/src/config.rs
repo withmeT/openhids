@@ -65,6 +65,15 @@ pub struct Config {
 
     /// 文件监控路径（非空则启用 inotify 类监听）；建议配置关键目录如 `/etc`、`/var/www`。
     pub file_watch_paths: Vec<String>,
+
+    /// 是否启用 TLS 明文观测（OpenSSL `SSL_write` / `SSL_read` uprobe）。
+    pub tls_monitor_enabled: bool,
+    /// 要附加的 OpenSSL 动态库路径。`auto` 表示自动探测 `libssl.so`。
+    pub tls_libssl_path: String,
+    /// 仅保留进程名包含该关键字的 TLS 事件（如 `nginx`）。
+    pub tls_target_comm: String,
+    /// 仅保留 Host 头含该端口（如 `:18888`）的 HTTPS 请求/响应。
+    pub tls_target_port: u16,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -102,6 +111,10 @@ struct PartialConfig {
 
     proc_monitor_enabled: Option<bool>,
     file_watch_paths: Option<Vec<String>>,
+    tls_monitor_enabled: Option<bool>,
+    tls_libssl_path: Option<String>,
+    tls_target_comm: Option<String>,
+    tls_target_port: Option<u16>,
 }
 
 impl Config {
@@ -151,6 +164,11 @@ impl Config {
             // 默认关闭：exec/exit 事件量极大，生产请按需开启或通过 JSON/env 打开。
             proc_monitor_enabled: false,
             file_watch_paths: Vec::new(),
+
+            tls_monitor_enabled: false,
+            tls_libssl_path: "auto".to_string(),
+            tls_target_comm: "nginx".to_string(),
+            tls_target_port: 18888,
         };
 
         // Optional config file (JSON)
@@ -293,6 +311,16 @@ impl Config {
             }
         }
 
+        cfg.tls_monitor_enabled = std::env::var("HIDS_TLS_MONITOR_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.tls_monitor_enabled);
+        cfg.tls_libssl_path = std::env::var("HIDS_TLS_LIBSSL_PATH").unwrap_or(cfg.tls_libssl_path);
+        cfg.tls_target_comm = std::env::var("HIDS_TLS_TARGET_COMM").unwrap_or(cfg.tls_target_comm);
+        cfg.tls_target_port = parse_env_u64("HIDS_TLS_TARGET_PORT")
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(cfg.tls_target_port);
+
         Ok(cfg)
     }
 
@@ -369,6 +397,18 @@ impl Config {
         }
         if let Some(v) = partial.file_watch_paths {
             self.file_watch_paths = v;
+        }
+        if let Some(v) = partial.tls_monitor_enabled {
+            self.tls_monitor_enabled = v;
+        }
+        if let Some(v) = partial.tls_libssl_path {
+            self.tls_libssl_path = v;
+        }
+        if let Some(v) = partial.tls_target_comm {
+            self.tls_target_comm = v;
+        }
+        if let Some(v) = partial.tls_target_port {
+            self.tls_target_port = v;
         }
     }
 }

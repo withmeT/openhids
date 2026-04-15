@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// 单条从 eBPF ringbuf 拉取到用户态的“命令事件”，随后会被 batch/压缩后发送到接收端。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
-    /// 事件类型：0=bash 命令行，1=预留，2=flow，3=HTTP L7，4=execve，5=进程退出，6=文件变更
+    /// 事件类型：0=bash 命令行，1=预留，2=flow，3=HTTP L7，4=execve，5=进程退出，6=文件变更，7=TLS 明文
     pub event_kind: u8,
     pub ts_ms: u64,
     pub uid: u32,
@@ -73,6 +73,16 @@ pub struct AgentEvent {
     /// event_kind=6：变更类型（如 create / modify / remove / rename / other）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_op: Option<String>,
+
+    /// event_kind=7：TLS 明文方向（ssl_read / ssl_write）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_direction: Option<String>,
+    /// event_kind=7：TLS 明文截断（用于测试/检测，不建议生产全量留存）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_payload_trunc: Option<String>,
+    /// event_kind=7：命中的威胁类型（如 `sqli_keyword`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_threat: Option<String>,
 }
 
 /// 一次 HTTP 发送的“批次包裹层”，用于携带版本信息并保持事件数组不变。

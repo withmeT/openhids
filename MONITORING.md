@@ -34,6 +34,7 @@ flowchart TB
 | **tracepoint** | `trace_enter_execve` | `EXEC_EVENTS` (RingBuf) | **4** | `sys_enter_execve`，读 `filename` 用户指针，记录将执行的二进制路径。 |
 | **tracepoint** | `trace_enter_exit` / `trace_enter_exit_group` | `EXIT_EVENTS` (RingBuf) | **5** | 进程/线程退出，记录 `exit_code`。 |
 | **XDP** | `xdp_flow5tuple` | `FLOW_EVENTS` (RingBuf) | **2** | 入站 IPv4 **TCP**、目的端口在策略内（或全端口）、**SYN 且无 ACK** 时上报五元组；**始终 `XDP_PASS`**，不丢包、不改写业务。 |
+| **uprobe/uretprobe** | `uprobe_ssl_write` / `uprobe_ssl_read_enter` / `uretprobe_ssl_read` | `TLS_EVENTS` (RingBuf) | **7** | 对 OpenSSL `SSL_write`/`SSL_read` 抓取明文截断（测试 HTTPS 载荷检测；默认关闭）。 |
 
 配置项 **`proc_monitor_enabled`** 为 `false` 时，不加载上述 exec/exit tracepoint，也不从 `EXEC_EVENTS` / `EXIT_EVENTS` 读数据（避免事件风暴）。**默认代码中为 `false`**；示例配置里为 `true` 便于演示。
 
@@ -44,6 +45,8 @@ flowchart TB
 | Map 名 | 类型 | 用途 |
 |--------|------|------|
 | `EVENTS` / `EXEC_EVENTS` / `EXIT_EVENTS` / `FLOW_EVENTS` | RingBuf | 高频事件队列；用户态 `RingBuf::next()` 消费。 |
+| `TLS_EVENTS` | RingBuf | TLS 明文事件（OpenSSL hook）队列。 |
+| `TLS_READ_ARGS` | Hash(`u64`→`u64`) | `SSL_read` 入参（buf 指针）与返回配对，供 uretprobe 读取解密后数据。 |
 | `SKIP_IPS` | Hash(`u32`→`u8`) | 源与目的**同时**命中时可跳过（减少噪声），由配置 `xdp_skip_ips` 等填充。 |
 | `LOCAL_IPS` | Hash(`u32`→`u8`) | 本机 IPv4 集合，用于 XDP 判断 **inbound**（`dst` 为本机）。 |
 | `SENSITIVE_PORTS` | Hash(`u16`→`u8`) | 需要上报 flow 的 **目的端口** 列表；与 `xdp_sensitive_ports` 对应。 |
@@ -71,6 +74,7 @@ flowchart TB
 |------|------|--------------|------|
 | **HTTP L7** | `pnet_datalink` 抓包与解析 | **3** | 可配置端口、静态资源过滤、去重、Host/Cookie/响应码；明文 HTTP。 |
 | **文件变更** | `notify`（inotify 类） | **6** | 配置 `file_watch_paths` 后递归监视目录；适合 `/etc`、站点根目录等。 |
+| **TLS 明文（OpenSSL）** | `SSL_write`/`SSL_read` uprobe | **7** | 过滤 `tls_target_comm`（如 nginx）与 `tls_target_port`（如 18888），支持基础 SQLi 关键字检测。 |
 
 ---
 
@@ -102,5 +106,6 @@ flowchart TB
 | `file_watch_paths` / `HIDS_FILE_WATCH_PATHS`（分号分隔） | 监视目录列表。 |
 | `xdp_sensitive_ports` / `xdp_capture_all_ports` | XDP flow 端口策略。 |
 | `http_l7_ports` 等 | 用户态 HTTP 监测。 |
+| `tls_monitor_enabled` / `HIDS_TLS_MONITOR_ENABLED` | 是否启用 OpenSSL 明文观测。 |
 
 更完整的文件级说明见 [CODE_OVERVIEW.md](./CODE_OVERVIEW.md)。

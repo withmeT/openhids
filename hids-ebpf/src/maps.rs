@@ -15,6 +15,14 @@ pub static mut EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0
 #[map(name = "FLOW_EVENTS")]
 pub static mut FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
+/// TLS 明文事件输出（OpenSSL SSL_write/SSL_read）。
+#[map(name = "TLS_EVENTS")]
+pub static mut TLS_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+
+/// `SSL_read` 入参与返回配对：key=`pid_tgid`, value=buf_ptr(u64)。
+#[map(name = "TLS_READ_ARGS")]
+pub static mut TLS_READ_ARGS: HashMap<u64, u64> = HashMap::with_max_entries(32768, 0);
+
 /// 需要跳过的 IPv4 地址（源/目的都可能检查）。
 ///
 /// value 只是占位，用 1 表示命中。

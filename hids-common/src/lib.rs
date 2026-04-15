@@ -4,6 +4,8 @@ pub const COMM_LEN: usize = 16;
 pub const MAX_LINE: usize = 256;
 /// `execve` 路径缓冲（与 eBPF / 用户态 ABI 一致）。
 pub const MAX_EXEC_PATH: usize = 256;
+/// TLS 明文截断长度（HTTPS 解密后只取前 N 字节用于检测）。
+pub const TLS_DATA_MAX: usize = 512;
 
 /// Bash 命令行捕获事件（用于从 eBPF 上报到用户态）。
 ///
@@ -82,5 +84,20 @@ pub struct FlowEvent {
     pub is_sensitive_port: u8,
     /// IP 头部之后的传输层长度（粗略）
     pub payload_len: u32,
+}
+
+/// OpenSSL 明文事件（`SSL_write` / `SSL_read`）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TlsEvent {
+    pub pid: u32,
+    pub tgid: u32,
+    pub uid: u32,
+    pub comm: [u8; COMM_LEN],
+    /// 0=SSL_write(发送明文) 1=SSL_read(接收解密后明文)
+    pub direction: u8,
+    /// `data` 有效长度（<= TLS_DATA_MAX）
+    pub len: u32,
+    pub data: [u8; TLS_DATA_MAX],
 }
 
