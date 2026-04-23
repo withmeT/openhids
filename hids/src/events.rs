@@ -6,6 +6,8 @@ pub struct AgentEvent {
     /// 事件类型：0=bash 命令行，1=预留，2=flow，3=HTTP L7，4=execve，5=进程退出，6=文件变更，7=TLS 明文
     pub event_kind: u8,
     pub ts_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_ip: Option<String>,
     pub uid: u32,
     pub tgid: u32,
     pub pid: u32,

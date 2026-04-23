@@ -1,5 +1,6 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, RingBuf};
+use hids_common::TlsFdKey;
 
 // Increase ringbuf size to better handle short bursts without dropping events.
 #[map(name = "EVENTS")]
@@ -22,6 +23,14 @@ pub static mut TLS_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0
 /// `SSL_read` 入参与返回配对：key=`pid_tgid`, value=buf_ptr(u64)。
 #[map(name = "TLS_READ_ARGS")]
 pub static mut TLS_READ_ARGS: HashMap<u64, u64> = HashMap::with_max_entries(32768, 0);
+
+/// `SSL_read` 入参与返回配对：key=`pid_tgid`, value=ssl_ptr(u64)。
+#[map(name = "TLS_READ_SSLPTR")]
+pub static mut TLS_READ_SSLPTR: HashMap<u64, u64> = HashMap::with_max_entries(32768, 0);
+
+/// OpenSSL `SSL*` -> fd 关联（key 包含 tgid + ssl_ptr）。
+#[map(name = "TLS_SSL_FD")]
+pub static mut TLS_SSL_FD: HashMap<TlsFdKey, i32> = HashMap::with_max_entries(65536, 0);
 
 /// 需要跳过的 IPv4 地址（源/目的都可能检查）。
 ///

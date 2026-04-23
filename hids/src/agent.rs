@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fs,
     path::PathBuf,
     sync::{mpsc, Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -45,6 +46,7 @@ fn ipv4_str_to_be_u32(s: &str) -> Option<u32> {
 fn base_event(
     event_kind: u8,
     ts_ms: u64,
+    local_ip: Option<&str>,
     uid: u32,
     tgid: u32,
     pid: u32,
@@ -53,6 +55,7 @@ fn base_event(
     AgentEvent {
         event_kind,
         ts_ms,
+        local_ip: local_ip.map(ToOwned::to_owned),
         uid,
         tgid,
         pid,
@@ -130,9 +133,47 @@ fn detect_libssl_path(cfg_path: &str) -> Option<String> {
     None
 }
 
+fn parse_host_header(payload: &str) -> Option<&str> {
+    for line in payload.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("host") {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
+
 fn payload_hits_target_port(payload: &str, port: u16) -> bool {
+    // 0 = disable port filter.
+    if port == 0 {
+        return true;
+    }
+
+    // Fast-path: explicit `:port` exists in plaintext headers.
     let token = format!(":{port}");
-    payload.contains(&token)
+    if payload.contains(&token) {
+        return true;
+    }
+
+    // HTTP response usually has no Host header. For common HTTPS target port 443,
+    // allow responses once TLS monitor has already passed process-level filter.
+    if payload.starts_with("HTTP/") && port == 443 {
+        return true;
+    }
+
+    // Handle default-port host without explicit ":443"/":80", e.g.:
+    // `Host: 192.168.4.169` while request is actually to 443.
+    let Some(host) = parse_host_header(payload) else {
+        return false;
+    };
+    if let Some((_, p)) = host.rsplit_once(':') {
+        return p.trim().parse::<u16>().ok() == Some(port);
+    }
+    matches!(port, 80 | 443)
 }
 
 fn detect_sqli_keyword(payload_lc: &str) -> Option<String> {
@@ -159,6 +200,96 @@ fn be_u32_to_ipv4_str(ip_be: u32) -> String {
     let c = (ip_be >> 8) & 0xff;
     let d = ip_be & 0xff;
     format!("{a}.{b}.{c}.{d}")
+}
+
+#[derive(Debug, Clone)]
+struct TcpSocketTuple {
+    local_ip: String,
+    local_port: u16,
+    remote_ip: String,
+    remote_port: u16,
+}
+
+fn parse_socket_inode_from_fd(tgid: u32, fd: i32) -> Option<u64> {
+    if fd < 0 {
+        return None;
+    }
+    let path = format!("/proc/{tgid}/fd/{fd}");
+    let link = fs::read_link(path).ok()?;
+    let text = link.to_string_lossy();
+    let start = text.find("socket:[")?;
+    let rem = &text[start + "socket:[".len()..];
+    let end = rem.find(']')?;
+    rem[..end].parse::<u64>().ok()
+}
+
+fn parse_ipv4_hex_le(hex8: &str) -> Option<String> {
+    if hex8.len() != 8 {
+        return None;
+    }
+    let raw = u32::from_str_radix(hex8, 16).ok()?;
+    let b1 = (raw & 0xff) as u8;
+    let b2 = ((raw >> 8) & 0xff) as u8;
+    let b3 = ((raw >> 16) & 0xff) as u8;
+    let b4 = ((raw >> 24) & 0xff) as u8;
+    Some(format!("{b1}.{b2}.{b3}.{b4}"))
+}
+
+fn resolve_tcp_tuple_by_inode(tgid: u32, inode: u64) -> Option<TcpSocketTuple> {
+    // Prefer per-process net namespace view; fallback to host-wide.
+    let candidates = [format!("/proc/{tgid}/net/tcp"), "/proc/net/tcp".to_string()];
+    for p in candidates {
+        let text = fs::read_to_string(&p).ok()?;
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 {
+                continue;
+            }
+            let local = cols[1];
+            let remote = cols[2];
+            let inode_col = cols[9];
+            let Some(row_inode) = inode_col.parse::<u64>().ok() else {
+                continue;
+            };
+            if row_inode != inode {
+                continue;
+            }
+            let (lip_hex, lport_hex) = local.split_once(':')?;
+            let (rip_hex, rport_hex) = remote.split_once(':')?;
+            let local_ip = parse_ipv4_hex_le(lip_hex)?;
+            let remote_ip = parse_ipv4_hex_le(rip_hex)?;
+            let local_port = u16::from_str_radix(lport_hex, 16).ok()?;
+            let remote_port = u16::from_str_radix(rport_hex, 16).ok()?;
+            return Some(TcpSocketTuple {
+                local_ip,
+                local_port,
+                remote_ip,
+                remote_port,
+            });
+        }
+    }
+    None
+}
+
+fn resolve_tls_socket_tuple(tgid: u32, fd: i32) -> Option<TcpSocketTuple> {
+    let inode = parse_socket_inode_from_fd(tgid, fd)?;
+    resolve_tcp_tuple_by_inode(tgid, inode)
+}
+
+fn fill_tls_flow_fields(ae: &mut AgentEvent, tuple: &TcpSocketTuple, tls_direction: u8) {
+    // For server-side TLS (nginx), local is usually server and remote is client.
+    ae.flow_src_ip = Some(tuple.remote_ip.clone());
+    ae.flow_src_port = Some(tuple.remote_port);
+    ae.flow_dst_ip = Some(tuple.local_ip.clone());
+    ae.flow_dst_port = Some(tuple.local_port);
+    ae.flow_proto = Some(6);
+    ae.flow_direction = Some(if tls_direction == 1 { 1 } else { 2 });
+    ae.flow_correlation_key = Some(tcp_flow_correlation_key(
+        &tuple.remote_ip,
+        tuple.remote_port,
+        &tuple.local_ip,
+        tuple.local_port,
+    ));
 }
 
 fn detect_local_ipv4s() -> Vec<String> {
@@ -194,9 +325,17 @@ struct HttpL7Event {
 }
 
 fn sanitize_text_200(s: &str) -> String {
-    let mut out = String::with_capacity(200);
+    sanitize_text_n(s, 200)
+}
+
+fn sanitize_text_1024(s: &str) -> String {
+    sanitize_text_n(s, 1024)
+}
+
+fn sanitize_text_n(s: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(max_len.min(1024));
     for ch in s.chars() {
-        if out.len() >= 200 {
+        if out.len() >= max_len {
             break;
         }
         if ch.is_ascii_graphic() || ch == ' ' {
@@ -206,6 +345,56 @@ fn sanitize_text_200(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TlsStreamKey {
+    tgid: u32,
+    ssl_ptr: u64,
+    /// 0=ssl_write 1=ssl_read（与 eBPF direction 一致）
+    direction: u8,
+}
+
+#[derive(Debug)]
+struct TlsStreamBuf {
+    buf: Vec<u8>,
+    last_ts_ms: u64,
+}
+
+fn parse_content_length(header_part: &str) -> Option<usize> {
+    for line in header_part.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return value.trim().parse::<usize>().ok();
+            }
+        }
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+fn tls_http_message_complete(buf: &[u8]) -> Option<(usize, usize)> {
+    // returns (header_end_index, total_message_len)
+    let header_end = find_bytes(buf, b"\r\n\r\n")?;
+    let header_part = String::from_utf8_lossy(&buf[..header_end]);
+    let body_len = parse_content_length(&header_part).unwrap_or(0);
+    let total = header_end + 4 + body_len;
+    if buf.len() >= total {
+        Some((header_end, total))
+    } else {
+        None
+    }
 }
 
 /// 用户态 HTTP L7 嗅探线程与热重载共享的运行时参数（端口集合、静态路径过滤）。
@@ -548,14 +737,23 @@ async fn send_envelope(
         .context("send http request")?;
     let status = res.status();
     if !status.is_success() {
+        // Avoid dumping huge HTML debug pages or other large responses into logs.
         let text = res.text().await.unwrap_or_default();
-        anyhow::bail!("http status={status} body={text}");
+        let mut preview = sanitize_text_n(&text, 400);
+        if text.len() > preview.len() {
+            preview.push_str(" ...");
+        }
+        anyhow::bail!("http status={status} body_preview={preview}");
     }
     Ok(())
 }
 
 pub async fn run() -> Result<(), anyhow::Error> {
     let mut cfg = Config::load()?;
+    let agent_local_ip: Option<String> = detect_local_ipv4s()
+        .into_iter()
+        .find(|ip| ip != "127.0.0.1")
+        .or_else(|| Some("127.0.0.1".to_string()));
 
     const AGENT_VERSION: &str = env!("HIDS_GIT_SHA");
     let schema_version: u32 = env!("HIDS_SCHEMA_VERSION")
@@ -624,6 +822,28 @@ pub async fn run() -> Result<(), anyhow::Error> {
         ssl_read_enter_prog
             .attach("SSL_read", &libssl_path, None)
             .with_context(|| format!("attach SSL_read(entry) to {libssl_path}"))?;
+
+        // Best-effort: bind TLS `SSL*` to socket fd so event_kind=7 can carry src/dst tuple.
+        if let Some(p) = bpf.program_mut("uprobe_ssl_set_fd") {
+            let prog: &mut UProbe = p.try_into()?;
+            prog.load().context("load uprobe_ssl_set_fd")?;
+            let _ = prog.attach("SSL_set_fd", &libssl_path, None);
+        }
+        if let Some(p) = bpf.program_mut("uprobe_ssl_set_rfd") {
+            let prog: &mut UProbe = p.try_into()?;
+            prog.load().context("load uprobe_ssl_set_rfd")?;
+            let _ = prog.attach("SSL_set_rfd", &libssl_path, None);
+        }
+        if let Some(p) = bpf.program_mut("uprobe_ssl_set_wfd") {
+            let prog: &mut UProbe = p.try_into()?;
+            prog.load().context("load uprobe_ssl_set_wfd")?;
+            let _ = prog.attach("SSL_set_wfd", &libssl_path, None);
+        }
+        if let Some(p) = bpf.program_mut("uprobe_ssl_free") {
+            let prog: &mut UProbe = p.try_into()?;
+            prog.load().context("load uprobe_ssl_free")?;
+            let _ = prog.attach("SSL_free", &libssl_path, None);
+        }
 
         let tls_map = bpf.take_map("TLS_EVENTS").context("map TLS_EVENTS not found")?;
         ringbuf_tls = Some(RingBuf::try_from(tls_map)?);
@@ -780,6 +1000,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let mut http_dedup: HashMap<HttpDedupKey, u64> = HashMap::new();
     let mut last_http_dedup_prune = Instant::now();
 
+    // TLS 明文流式拼接（最佳努力）：按 (tgid, direction) 拼接连续的 SSL_read/write 片段，
+    // 尝试重组出完整的 HTTP/1.x 请求/响应（Content-Length 场景优先）。
+    let mut tls_streams: HashMap<TlsStreamKey, TlsStreamBuf> = HashMap::new();
+    let mut last_tls_streams_prune = Instant::now();
+
     loop {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -834,6 +1059,28 @@ pub async fn run() -> Result<(), anyhow::Error> {
             last_http_dedup_prune = Instant::now();
         }
 
+        // TLS 流缓存定期裁剪（避免长期运行/异常流量导致内存增长）。
+        if last_tls_streams_prune.elapsed() >= Duration::from_secs(2) {
+            let ttl_ms: u64 = 10_000;
+            tls_streams.retain(|_, st| now_ms.saturating_sub(st.last_ts_ms) < ttl_ms);
+            // hard cap: keep only the most recent N streams
+            const MAX_TLS_STREAMS: usize = 1024;
+            if tls_streams.len() > MAX_TLS_STREAMS {
+                // best-effort: drop arbitrary extras (HashMap order is unspecified).
+                let drop_n = tls_streams.len() - MAX_TLS_STREAMS;
+                let mut dropped = 0usize;
+                let keys: Vec<TlsStreamKey> = tls_streams.keys().copied().take(drop_n).collect();
+                for k in keys {
+                    tls_streams.remove(&k);
+                    dropped += 1;
+                    if dropped >= drop_n {
+                        break;
+                    }
+                }
+            }
+            last_tls_streams_prune = Instant::now();
+        }
+
         // 1) read events (fast)
         while let Some(item) = ringbuf_cmd.next() {
             if item.len() < core::mem::size_of::<CommandEvent>() {
@@ -846,7 +1093,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let line = cstr_from_fixed(&ev.line);
             let ts_ms = now_ms;
 
-            let mut ae = base_event(0, ts_ms, ev.uid, ev.tgid, ev.pid, comm);
+            let mut ae = base_event(
+                0,
+                ts_ms,
+                agent_local_ip.as_deref(),
+                ev.uid,
+                ev.tgid,
+                ev.pid,
+                comm,
+            );
             ae.line = Some(line);
             batcher.push(ae);
         }
@@ -860,7 +1115,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 let ev = unsafe { core::ptr::read_unaligned(ptr) };
                 let comm = cstr_from_fixed(&ev.comm);
                 let path = exec_filename_to_string(&ev.filename, ev.filename_len);
-                let mut ae = base_event(4, now_ms, ev.uid, ev.tgid, ev.pid, comm);
+                let mut ae = base_event(
+                    4,
+                    now_ms,
+                    agent_local_ip.as_deref(),
+                    ev.uid,
+                    ev.tgid,
+                    ev.pid,
+                    comm,
+                );
                 ae.exec_path = Some(path);
                 batcher.push(ae);
             }
@@ -874,7 +1137,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 let ptr = item.as_ptr() as *const ExitEvent;
                 let ev = unsafe { core::ptr::read_unaligned(ptr) };
                 let comm = cstr_from_fixed(&ev.comm);
-                let mut ae = base_event(5, now_ms, ev.uid, ev.tgid, ev.pid, comm);
+                let mut ae = base_event(
+                    5,
+                    now_ms,
+                    agent_local_ip.as_deref(),
+                    ev.uid,
+                    ev.tgid,
+                    ev.pid,
+                    comm,
+                );
                 ae.exit_code = Some(ev.exit_code);
                 batcher.push(ae);
             }
@@ -896,27 +1167,152 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 if n == 0 {
                     continue;
                 }
-                let payload_raw = String::from_utf8_lossy(&ev.data[..n]).to_string();
-                if !payload_hits_target_port(&payload_raw, cfg.tls_target_port) {
-                    continue;
-                }
-
-                let payload_lc = payload_raw.to_ascii_lowercase();
-                let is_post = payload_lc.contains("post ");
-                let threat = detect_sqli_keyword(&payload_lc);
-                if !is_post && threat.is_none() {
-                    continue;
-                }
-
-                let mut ae = base_event(7, now_ms, ev.uid, ev.tgid, ev.pid, comm);
-                ae.tls_direction = Some(if ev.direction == 1 {
-                    "ssl_read".to_string()
-                } else {
-                    "ssl_write".to_string()
+                let key = TlsStreamKey {
+                    tgid: ev.tgid,
+                    ssl_ptr: ev.ssl_ptr,
+                    direction: ev.direction,
+                };
+                let st = tls_streams.entry(key).or_insert_with(|| TlsStreamBuf {
+                    buf: Vec::with_capacity(4096),
+                    last_ts_ms: now_ms,
                 });
-                ae.tls_payload_trunc = Some(sanitize_text_200(&payload_raw));
-                ae.tls_threat = threat;
-                batcher.push(ae);
+                st.last_ts_ms = now_ms;
+                st.buf.extend_from_slice(&ev.data[..n]);
+
+                // avoid unbounded growth (best-effort)
+                const MAX_TLS_BUF: usize = 128 * 1024;
+                if st.buf.len() > MAX_TLS_BUF {
+                    let drain_n = st.buf.len() - MAX_TLS_BUF;
+                    st.buf.drain(0..drain_n);
+                }
+
+                // Try to extract as many complete HTTP messages as possible from the buffer.
+                let mut emitted = false;
+                loop {
+                    let Some((_hdr_end, total_len)) = tls_http_message_complete(&st.buf) else {
+                        break;
+                    };
+                    let msg: Vec<u8> = st.buf.drain(0..total_len).collect();
+
+                    // `msg` should be a full HTTP/1.x message (best-effort).
+                    let payload_raw = String::from_utf8_lossy(&msg).to_string();
+                    if !payload_hits_target_port(&payload_raw, cfg.tls_target_port) {
+                        continue;
+                    }
+
+                    let mut ae = base_event(
+                        7,
+                        now_ms,
+                        agent_local_ip.as_deref(),
+                        ev.uid,
+                        ev.tgid,
+                        ev.pid,
+                        comm.clone(),
+                    );
+                    ae.tls_direction = Some(if ev.direction == 1 {
+                        "ssl_read".to_string()
+                    } else {
+                        "ssl_write".to_string()
+                    });
+                    ae.tls_payload_trunc = Some(sanitize_text_1024(&payload_raw));
+                    ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
+                    if let Some(tuple) = resolve_tls_socket_tuple(ev.tgid, ev.fd) {
+                        fill_tls_flow_fields(&mut ae, &tuple, ev.direction);
+                    }
+
+                    // Fill HTTP semantic fields if possible (so server can index/query easily).
+                    let payload_lc = payload_raw.to_ascii_lowercase();
+                    let threat = detect_sqli_keyword(&payload_lc);
+                    ae.tls_threat = threat;
+
+                    if let Some((method, url, host, cookie, body_trunc)) =
+                        parse_http_request_details(&msg)
+                    {
+                        // Reuse the same static ignore rules as HTTP L7 sniffer (if available).
+                        let drop = if let Some(rt) = http_l7_runtime.as_ref() {
+                            rt.read()
+                                .map(|g| g.should_drop_url(&url))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if drop {
+                            continue;
+                        }
+
+                        ae.http_method = Some(method);
+                        ae.http_url = Some(url);
+                        ae.http_body_trunc = Some(body_trunc);
+                        ae.http_host = host;
+                        ae.http_cookie_trunc = cookie;
+                    } else if let Some(status) = parse_http_response_status(&msg) {
+                        ae.http_status = Some(status);
+                        // keep a light body trunc for response visibility
+                        if let Some(idx) = payload_raw.find("\r\n\r\n") {
+                            ae.http_body_trunc = Some(sanitize_text_200(&payload_raw[idx + 4..]));
+                        }
+                    }
+
+                    batcher.push(ae);
+                    emitted = true;
+                }
+
+                // Fallback: if we cannot reconstruct a full HTTP message yet, still emit
+                // current TLS plaintext chunk to avoid silent drops (best-effort visibility).
+                if !emitted {
+                    let chunk_raw = String::from_utf8_lossy(&ev.data[..n]).to_string();
+                    let chunk_lc = chunk_raw.to_ascii_lowercase();
+                    let looks_http_req = chunk_lc.starts_with("get ")
+                        || chunk_lc.starts_with("post ")
+                        || chunk_lc.starts_with("put ")
+                        || chunk_lc.starts_with("delete ")
+                        || chunk_lc.starts_with("head ")
+                        || chunk_lc.starts_with("options ")
+                        || chunk_lc.starts_with("patch ");
+                    let looks_http_resp = chunk_lc.starts_with("http/");
+                    let looks_h2_preface = chunk_raw.starts_with("PRI * HTTP/2.0");
+                    if looks_http_req || looks_http_resp || looks_h2_preface {
+                        if payload_hits_target_port(&chunk_raw, cfg.tls_target_port) {
+                            let mut ae = base_event(
+                                7,
+                                now_ms,
+                                agent_local_ip.as_deref(),
+                                ev.uid,
+                                ev.tgid,
+                                ev.pid,
+                                comm.clone(),
+                            );
+                            ae.tls_direction = Some(if ev.direction == 1 {
+                                "ssl_read".to_string()
+                            } else {
+                                "ssl_write".to_string()
+                            });
+                            ae.tls_payload_trunc = Some(sanitize_text_1024(&chunk_raw));
+                            ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
+                            if let Some(tuple) = resolve_tls_socket_tuple(ev.tgid, ev.fd) {
+                                fill_tls_flow_fields(&mut ae, &tuple, ev.direction);
+                            }
+                            ae.tls_threat = detect_sqli_keyword(&chunk_lc);
+
+                            if looks_http_req {
+                                if let Some((method, url, host, cookie, body_trunc)) =
+                                    parse_http_request_details(&ev.data[..n])
+                                {
+                                    ae.http_method = Some(method);
+                                    ae.http_url = Some(url);
+                                    ae.http_body_trunc = Some(body_trunc);
+                                    ae.http_host = host;
+                                    ae.http_cookie_trunc = cookie;
+                                }
+                            } else if looks_http_resp {
+                                if let Some(status) = parse_http_response_status(&ev.data[..n]) {
+                                    ae.http_status = Some(status);
+                                }
+                            }
+                            batcher.push(ae);
+                        }
+                    }
+                }
             }
         }
 
@@ -934,7 +1330,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 let d_ip = be_u32_to_ipv4_str(ev.dst_ip);
                 let flow_key = tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
 
-                let mut ae = base_event(2, now_ms, 0, 0, 0, "xdp".to_string());
+                let mut ae = base_event(
+                    2,
+                    now_ms,
+                    agent_local_ip.as_deref(),
+                    0,
+                    0,
+                    0,
+                    "xdp".to_string(),
+                );
                 ae.flow_correlation_key = Some(flow_key);
                 ae.flow_src_ip = Some(s_ip);
                 ae.flow_dst_ip = Some(d_ip);
@@ -986,7 +1390,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     tcp_flow_correlation_key(&ev.src_ip, ev.src_port, &ev.dst_ip, ev.dst_port)
                 };
 
-                let mut ae = base_event(3, now_ms, 0, 0, 0, "http_l7".to_string());
+                let mut ae = base_event(
+                    3,
+                    now_ms,
+                    agent_local_ip.as_deref(),
+                    0,
+                    0,
+                    0,
+                    "http_l7".to_string(),
+                );
                 ae.flow_correlation_key = Some(flow_key);
                 ae.flow_src_ip = Some(ev.src_ip);
                 ae.flow_dst_ip = Some(ev.dst_ip);
@@ -1016,7 +1428,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
         if let Some(fw_rx) = file_watch_rx.as_ref() {
             while let Ok(ev) = fw_rx.try_recv() {
-                let mut ae = base_event(6, now_ms, 0, 0, 0, "file_watch".to_string());
+                let mut ae = base_event(
+                    6,
+                    now_ms,
+                    agent_local_ip.as_deref(),
+                    0,
+                    0,
+                    0,
+                    "file_watch".to_string(),
+                );
                 ae.file_path = Some(ev.path);
                 ae.file_op = Some(ev.op);
                 batcher.push(ae);

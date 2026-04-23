@@ -1,6 +1,6 @@
 {
   "host_id": null,
-  "ingest_url": "http://127.0.0.1:8899/ingest",
+  "ingest_url": "http://127.0.0.1:8000/ingest",
   "flush_bytes": 1048576,
   "flush_interval_ms": 2000,
   "flush_max_events": 2000,
@@ -50,5 +50,5 @@
   "tls_monitor_enabled": true,
   "tls_libssl_path": "auto",
   "tls_target_comm": "nginx",
-  "tls_target_port": 18888
+  "tls_target_port": 443
 }

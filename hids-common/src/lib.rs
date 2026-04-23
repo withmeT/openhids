@@ -4,8 +4,11 @@ pub const COMM_LEN: usize = 16;
 pub const MAX_LINE: usize = 256;
 /// `execve` 路径缓冲（与 eBPF / 用户态 ABI 一致）。
 pub const MAX_EXEC_PATH: usize = 256;
-/// TLS 明文截断长度（HTTPS 解密后只取前 N 字节用于检测）。
-pub const TLS_DATA_MAX: usize = 512;
+/// TLS 明文截断长度（HTTPS 解密后只取前 N 字节用于检测/解析）。
+///
+/// 说明：这里是每次 `SSL_read`/`SSL_write` 事件能携带的最大明文字节数，
+/// 并不代表会“全量留存”。用户态仍会做截断/脱敏/过滤后再上报。
+pub const TLS_DATA_MAX: usize = 2048;
 
 /// Bash 命令行捕获事件（用于从 eBPF 上报到用户态）。
 ///
@@ -86,6 +89,14 @@ pub struct FlowEvent {
     pub payload_len: u32,
 }
 
+/// TLS 连接 fd 关联键：`tgid + ssl_ptr`。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TlsFdKey {
+    pub tgid: u32,
+    pub ssl_ptr: u64,
+}
+
 /// OpenSSL 明文事件（`SSL_write` / `SSL_read`）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +105,12 @@ pub struct TlsEvent {
     pub tgid: u32,
     pub uid: u32,
     pub comm: [u8; COMM_LEN],
+    /// OpenSSL `SSL*` 指针（作为连接/会话级别的关联键；不同连接通常不同）。
+    ///
+    /// 注意：这是实现细节字段，仅用于在用户态做“同连接重组/去重”，不要当作稳定标识跨机器/跨重启持久化。
+    pub ssl_ptr: u64,
+    /// OpenSSL 连接对应的 FD（通过 `SSL_set_fd` 等函数记录），未知时为 -1。
+    pub fd: i32,
     /// 0=SSL_write(发送明文) 1=SSL_read(接收解密后明文)
     pub direction: u8,
     /// `data` 有效长度（<= TLS_DATA_MAX）
