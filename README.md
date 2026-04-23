@@ -1,119 +1,118 @@
 # hids
 
-各源码文件职责说明见 **[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)**。  
-**监测架构（eBPF 探针、RingBuf、XDP 行为、事件类型）**见 **[MONITORING.md](./MONITORING.md)**。
+当前项目是一个以 eBPF 为核心的主机侧监测 Agent，默认只做采集和上报，不做阻断。
 
-## Prerequisites
+各源码文件职责见 **[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)**，架构说明见 **[MONITORING.md](./MONITORING.md)**。
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. Linux kernel >= 5.8（RingBuf 需要；建议 >= 5.15）
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
-1. (recommended) `bpftool` for debugging: install from your distro packages
+## 环境要求
 
-## Build & Run
+1. stable rust: `rustup toolchain install stable`
+1. nightly rust: `rustup toolchain install nightly --component rust-src`
+1. Linux kernel >= 5.8（建议 >= 5.15）
+1. `bpf-linker`: `cargo install bpf-linker`
+1. 建议安装 `bpftool` 便于排障
 
-本项目是一个最小可跑的 HIDS 原型：
-
-- eBPF 程序：对 `/bin/bash` 的 `readline` 做 `uretprobe`，捕获返回值（用户刚输入的命令行）
-- 用户态：从 eBPF `RingBuf` 读取事件并打印
-
-Use `cargo build`, `cargo check`, etc. as normal. Build & run with:
+## 构建与运行
 
 ```shell
 cargo build -p hids --release
 sudo ./target/release/hids
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+## 当前功能总览
 
-## Validate (quick test)
+### 事件类型（`event_kind`）
 
-1. 开一个新的终端，运行上面的 `sudo ./target/release/hids`，看到提示 `Attached to /bin/bash:readline...`
-2. 再开一个终端启动 bash：`/bin/bash`
-3. 在 bash 里随便输入几条命令（例如 `id`、`uname -a`、`echo hello`）
-4. 回到 hids 终端，你应该能看到类似输出：
+- `0`: bash 命令行（`/bin/bash:readline` uretprobe）
+- `2`: XDP 五元组流（重点是入站 TCP SYN）
+- `3`: 用户态明文 HTTP L7（请求/响应解析）
+- `4`: 进程创建（`execve`）
+- `5`: 进程退出（`exit/exit_group`）
+- `6`: 文件变更（inotify 类监听）
+- `7`: TLS 明文（OpenSSL `SSL_read` / `SSL_write`）
 
-```text
-uid=0 tgid=12345 pid=12345 comm=bash line=id
-```
+### 网络与协议能力
 
-注意：如果你在 bash 里执行的是 shell 内建命令（如 `cd`），依然会被捕获，因为它来自 readline 输入。
+- **XDP（kind=2）**
+  - 端口可配置：`xdp_capture_all_ports` 或 `xdp_sensitive_ports`
+  - 上报五元组、方向、flags、关联键
 
-## Troubleshooting
+- **HTTP L7（kind=3）**
+  - 监听 `http_l7_ports`（明文 HTTP）
+  - 解析 method/url/host/cookie/status/body_trunc
+  - 去重窗口 + 静态资源过滤
+  - 与 flow 用 `flow_correlation_key` 对齐
 
-- **无法 attach / 没有输出**：确认目标是 `/bin/bash`，以及 bash 确实使用了 `readline`（多数发行版默认是）。
-- **权限错误**：需要 root（或者正确配置 `CAP_BPF`/`CAP_SYS_ADMIN`，以及允许加载 eBPF）。
-- **内核限制/安全策略**：某些环境（如容器、受限内核、SELinux policy）可能阻止 uprobe 或 BPF；可用 `dmesg` / `bpftool prog show` 辅助排查。
-- **访问了某端口（如 9200 ES、自定义业务口）但没有任何 flow / HTTP 提示**：
-  - **XDP flow（event_kind=2）** 只在 **目标端口** 属于 eBPF 内建的「敏感端口」列表时才会对 **入站 TCP SYN** 上报；不在列表里的端口不会出现 flow 事件（**改列表需改 eBPF 并重编、重启 Agent**）。
-  - **HTTP L7（event_kind=3）** 只嗅探配置里的 **`http_l7_ports`**（默认含 80、8080、8000、**9200**）；请把业务明文 HTTP 端口写进 `hids-agent.json` 或 `HIDS_HTTP_L7_PORTS`，修改后热重载即可（无需重启）。
-  - **Docker 映射**：若你从外网打的是 **宿主机 IP:9200**，数据包目的 IP 应是宿主机网卡 IP，一般能命中「入站」；若直接访问 **容器 IP**（非 `LOCAL_IPS` 里的地址），XDP 可能不把该流标成入站，需把该网段纳入本机 IP 检测或调整部署。
+- **TLS 明文（kind=7）**
+  - uprobe OpenSSL `SSL_write` / `SSL_read`
+  - 支持按 `tls_target_comm`、`tls_target_port` 过滤
+  - 尽量重组 HTTP/1.x，无法完整重组时回退上报片段
+  - 解析 `http_method` / `http_url` / `http_status` / `http_body_trunc`
+  - SQLi 关键字检测：命中填 `tls_threat=sqli_keyword`
+  - 支持连接级关联键（`ssl_ptr`）
+  - **best-effort 绑定来源/目的 IP**
+    - 内核记录 `SSL* -> fd`
+    - 用户态通过 `/proc/<tgid>/fd` + `/proc/*/net/tcp` 还原四元组并回填到 `flow_src_*`/`flow_dst_*`
+    - 若连接复用或时序未命中，可能出现少量 kind=7 无 IP（这是当前已知边界）
 
-## 运行权限与能力（建议阅读）
+### 通用字段与上报
 
-Agent 默认以 **root** 运行（`sudo ./target/release/hids`），典型需求如下：
+- 每条事件携带 `local_ip`（本机地址）
+- 批量发送（envelope + `events[]`），服务端可拆分逐条入库
+- 失败时写入 spool，网络恢复后回放（at-least-once）
+- 当前默认 `schema_version=3`
 
-| 能力 | 用途 |
-|------|------|
-| **root** 或 **`CAP_BPF` + `CAP_PERFMON` 等** | 加载 eBPF、挂载 uprobe/XDP（具体以发行版/内核策略为准）。 |
-| **root** 或 **`CAP_NET_RAW` + `CAP_NET_ADMIN`**（视实现） | 用户态 **HTTP L7** 嗅探使用 `pnet_datalink` 抓包；无足够权限时网卡可能打开失败或收不到帧。 |
-| **root**（推荐） | **XDP** 挂载到网卡；非 root 场景依赖内核/策略，通常仍建议 root。 |
+## 配置说明（核心项）
 
-精简结论：**生产环境建议直接 `sudo` 运行**；若坚持非 root，需按环境逐项授予上述 capability，并自行验证 attach/抓包是否成功。
+可用 `hids-agent.json` 或环境变量覆盖（`HIDS_*`）。
 
-## 路线图（P1 / P2 / P3）
+- `ingest_url`: 上报地址（如 `http://127.0.0.1:8000/ingest`）
+- `config_reload_interval_secs`: 热重载轮询间隔
+- `xdp_enabled` / `xdp_iface` / `xdp_skip_ips`
+- `xdp_capture_all_ports` / `xdp_sensitive_ports`
+- `http_l7_ports`
+- `http_l7_dedup_window_ms`
+- `http_l7_ignore_path_prefixes` / `http_l7_ignore_path_suffixes`
+- `http_l7_capture_response`
+- `proc_monitor_enabled`
+- `file_watch_paths`
+- `tls_monitor_enabled`
+- `tls_libssl_path`（`auto` 或绝对路径）
+- `tls_target_comm`（如 `nginx`）
+- `tls_target_port`（`0` 表示关闭端口过滤）
 
-### P1 — 采集更准、更稳（当前优先）
+## 运行权限建议
 
-1. **配置热重载**：在 `config_reload_interval_secs` 周期内重读 `HIDS_CONFIG_PATH`（默认 `./hids-agent.json`）。**HTTP L7** 相关的 `http_l7_ports`、静态路径过滤、去重窗口可在运行时生效（嗅探线程通过共享状态更新）。**XDP**（`xdp_enabled` / `xdp_iface` / `xdp_skip_ips`）在进程启动时已加载 eBPF 并挂载网卡，**修改后需重启进程**才能重配 maps/挂载点。
-2. **HTTP L7 去重**：相同五元组 + HTTP 方法 + URL 在 `http_l7_dedup_window_ms` 内只上报一次；`0` 关闭去重。
-3. **静态资源过滤（可配置）**：`http_l7_ignore_path_prefixes` / `http_l7_ignore_path_suffixes` 用于降噪（如 `/favicon.ico`、`*.js`）。
-4. **权限与运行说明**：见上文「运行权限与能力」。
+建议直接 root 运行。若非 root，需要按环境补齐 eBPF / raw socket / XDP 相关 capability。
 
-### P2 — 协议与关联增强（已实现）
+## 常见问题
 
-1. **更细的 HTTP 解析**：请求行解析外，提取 **Host**、**Cookie**（截断为线索字段）；可选嗅探本机 **出站 HTTP 响应**首行以解析 **状态码**（`http_l7_capture_response`，默认 `true`；可用 `HIDS_HTTP_L7_CAPTURE_RESPONSE=false` 关闭）。
-2. **与 flow 关联**：`event_kind=2`（XDP flow）与 `event_kind=3`（HTTP L7）均带 **`flow_correlation_key`**，格式为 `tcp:客户端IP:端口->服务端IP:端口`（响应事件已规范化为与入站 flow 同一客户端→服务端方向，便于 JOIN）。时间对齐仍在平台侧按 `ts_ms` 窗口完成。
-3. **schema**：默认 **`schema_version=2`**（新增字段）；旧接收端若只忽略未知字段可继续工作。
+- **只看到 443 的 kind=2，没有 kind=7**
+  - 说明 XDP 命中但 TLS 明文链路未命中或被过滤
+  - 检查：`tls_monitor_enabled`、`tls_target_comm`、`tls_target_port`
+  - 建议先用 `curl -k --http1.1 -H "Connection: close"` 触发新连接验证
 
-### P3 — 规模化与运维
+- **kind=7 有明文但缺少来源 IP**
+  - 当前是 best-effort 绑定（依赖 `SSL*->fd` 和 `/proc/net/tcp`）
+  - 连接复用、时序、命名空间等因素可能导致个别事件无 IP
 
-- 采集端采样、限流、多队列；与 ingest 的背压策略文档化。
-- HTTPS 侧信道（如 **TLS ClientHello 的 SNI**、**JA3** 等）需独立方案与合规评估，可作为后续阶段。
+- **日志刷屏 HTML 报错页**
+  - 客户端已改为仅打印失败 body 预览
+  - 服务端请确认 `ingest_url` 路径和协议正确（通常是 `/ingest`）
 
-## 配置片段（HTTP L7，P1 / P2）
+## 快速验证（HTTPS POST）
 
-示例见 `hids-agent.json.example`。环境变量覆盖示例：
-
-- `HIDS_HTTP_L7_PORTS=80,8080`
-- `HIDS_HTTP_L7_DEDUP_WINDOW_MS=2000`（`0` 关闭去重）
-- `HIDS_HTTP_L7_IGNORE_PREFIXES`：分号分隔，如 `/favicon.ico;/static/`
-- `HIDS_HTTP_L7_IGNORE_SUFFIXES`：分号分隔，如 `.js;.css;.map`
-- `HIDS_HTTP_L7_CAPTURE_RESPONSE=true|false`（P2：是否解析本机发出的 HTTP 响应状态码）
-- `HIDS_XDP_CAPTURE_ALL_PORTS=true|false`（XDP 是否全端口采集；开启后事件量会明显增加）
-- `HIDS_XDP_SENSITIVE_PORTS=22,80,443,3306,6379,8080,8000,9200`（仅在 `HIDS_XDP_CAPTURE_ALL_PORTS=false` 时生效）
-- `HIDS_PROC_MONITOR_ENABLED=true|false`（eBPF **execve / exit** tracepoint，`event_kind` 为 **4** / **5**；事件量很大，默认 `false`，建议在 `hids-agent.json` 按需开启）
-- `HIDS_FILE_WATCH_PATHS=/etc;/var/www`（用户态 **inotify** 类目录监听，`event_kind=6`；与 exec/exit、XDP 一样需在**启动时**根据配置初始化）
-- `HIDS_TLS_MONITOR_ENABLED=true|false`（OpenSSL `SSL_write`/`SSL_read` 明文观测，`event_kind=7`）
-- `HIDS_TLS_LIBSSL_PATH=auto|/path/to/libssl.so.3`（TLS uprobe 目标库）
-- `HIDS_TLS_TARGET_COMM=nginx`（仅保留进程名包含该关键字的 TLS 事件）
-- `HIDS_TLS_TARGET_PORT=18888`（仅保留 Host 头含 `:18888` 的 TLS 明文 HTTP 事件，便于你当前 nginx HTTPS 测试）
-
-### HTTPS 明文测试（nginx:18888）
-
-1. 在 `hids-agent.json` 中开启：
-   - `tls_monitor_enabled=true`
-   - `tls_target_comm=\"nginx\"`
-   - `tls_target_port=18888`
-2. 启动 agent（需要 root）。
-3. 发起测试请求（含 SQLi 关键字）：
-   - `curl -k -X POST "https://127.0.0.1:18888/login" -d "id=1' UNION SELECT 1,2,3--"`
-4. 预期：接收端出现 `event_kind=7`，并带 `tls_payload_trunc`；若命中关键词则 `tls_threat=sqli_keyword`。
+1. `hids-agent.json` 里开启 TLS：
+   - `tls_monitor_enabled: true`
+   - `tls_target_comm: "nginx"`
+   - `tls_target_port: 443`（或先设 `0` 排障）
+2. 启动 agent：`sudo ./target/release/hids`
+3. 发请求：
+   - `curl -k --http1.1 -H "Connection: close" -X POST "https://127.0.0.1/login" -d '{"id":1}'`
+4. 预期：
+   - kind=7 出现 `tls_payload_trunc`
+   - POST 出现 `http_method=http POST`（字段为 `POST`）和 `http_body_trunc`
+   - 条件命中时出现 `flow_src_ip`/`flow_dst_ip`
 
 ## Cross-compiling on macOS
 
