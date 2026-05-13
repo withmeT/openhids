@@ -14,6 +14,9 @@ pub struct AgentEvent {
     pub comm: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<String>,
+    /// event_kind=0：SSH 会话内交互 shell 时，尽力解析远程客户端 IPv4（沿父进程找到 `sshd` 并对照 `/proc/net/tcp`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_client_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]

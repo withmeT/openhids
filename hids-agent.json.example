@@ -48,6 +48,9 @@
   "file_watch_paths": [
     "/etc"
   ],
+  "ssh_listen_ports": [
+    22
+  ],
   "tls_monitor_enabled": true,
   "tls_libssl_path": "auto",
   "tls_target_comm": "nginx",

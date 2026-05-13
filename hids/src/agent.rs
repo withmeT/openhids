@@ -61,6 +61,7 @@ fn base_event(
         pid,
         comm: comm.into(),
         line: None,
+        ssh_client_ip: None,
         exit_code: None,
         success: None,
         flow_correlation_key: None,
@@ -274,6 +275,131 @@ fn resolve_tcp_tuple_by_inode(tgid: u32, inode: u64) -> Option<TcpSocketTuple> {
 fn resolve_tls_socket_tuple(tgid: u32, fd: i32) -> Option<TcpSocketTuple> {
     let inode = parse_socket_inode_from_fd(tgid, fd)?;
     resolve_tcp_tuple_by_inode(tgid, inode)
+}
+
+/// `/proc/net/tcp` 状态列（十六进制），`01` = TCP_ESTABLISHED。
+const PROC_TCP_ESTABLISHED: &str = "01";
+
+fn read_proc_ppid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if line.starts_with("PPid:") {
+            return line.split_whitespace().nth(1)?.parse().ok();
+        }
+    }
+    None
+}
+
+fn read_proc_comm(pid: u32) -> Option<String> {
+    let s = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(s.trim_end_matches('\n').to_string())
+}
+
+fn find_sshd_ancestor(mut pid: u32) -> Option<u32> {
+    for _ in 0..48 {
+        let comm = read_proc_comm(pid)?;
+        if comm == "sshd" {
+            return Some(pid);
+        }
+        let ppid = read_proc_ppid(pid)?;
+        if ppid <= 1 {
+            break;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+fn collect_socket_inodes(pid: u32) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Ok(link) = fs::read_link(e.path()) else {
+            continue;
+        };
+        let text = link.to_string_lossy();
+        if let Some(rest) = text.strip_prefix("socket:[") {
+            if let Some(end) = rest.find(']') {
+                if let Ok(inode) = rest[..end].parse::<u64>() {
+                    out.insert(inode);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn ssh_client_ipv4_from_sshd(sshd_pid: u32, listen_ports: &HashSet<u16>) -> Option<String> {
+    let inodes = collect_socket_inodes(sshd_pid);
+    if inodes.is_empty() {
+        return None;
+    }
+
+    let paths = [
+        format!("/proc/{sshd_pid}/net/tcp"),
+        "/proc/net/tcp".to_string(),
+    ];
+    for p in paths {
+        let Ok(text) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 {
+                continue;
+            }
+            if cols[3] != PROC_TCP_ESTABLISHED {
+                continue;
+            }
+            let inode_col = cols[9];
+            let Ok(row_inode) = inode_col.parse::<u64>() else {
+                continue;
+            };
+            if !inodes.contains(&row_inode) {
+                continue;
+            }
+            let local = cols[1];
+            let remote = cols[2];
+            let Some((_lip_hex, lport_hex)) = local.split_once(':') else {
+                continue;
+            };
+            let Some((rip_hex, rport_hex)) = remote.split_once(':') else {
+                continue;
+            };
+            let local_port = match u16::from_str_radix(lport_hex, 16) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !listen_ports.contains(&local_port) {
+                continue;
+            }
+            let Some(remote_ip) = parse_ipv4_hex_le(rip_hex) else {
+                continue;
+            };
+            let Ok(remote_port) = u16::from_str_radix(rport_hex, 16) else {
+                continue;
+            };
+            if remote_ip == "0.0.0.0" && remote_port == 0 {
+                continue;
+            }
+            candidates.push(remote_ip);
+        }
+        if !candidates.is_empty() {
+            if let Some(ip) = candidates.iter().find(|ip| *ip != "127.0.0.1") {
+                return Some(ip.clone());
+            }
+            return Some(candidates[0].clone());
+        }
+    }
+    None
+}
+
+fn resolve_ssh_client_ip_for_shell(shell_pid: u32, listen_ports: &HashSet<u16>) -> Option<String> {
+    let sshd = find_sshd_ancestor(shell_pid)?;
+    ssh_client_ipv4_from_sshd(sshd, listen_ports)
 }
 
 fn fill_tls_flow_fields(ae: &mut AgentEvent, tuple: &TcpSocketTuple, tls_direction: u8) {
@@ -1005,6 +1131,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let mut tls_streams: HashMap<TlsStreamKey, TlsStreamBuf> = HashMap::new();
     let mut last_tls_streams_prune = Instant::now();
 
+    // bash `tgid` -> 已解析的 SSH 客户端 IPv4（同一 shell 会话内避免重复扫 /proc）。
+    let mut ssh_client_ip_by_tgid: HashMap<u32, String> = HashMap::new();
+
     loop {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1044,6 +1173,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 cfg.tls_target_port = new_cfg.tls_target_port;
 
                 cfg.host_id = new_cfg.host_id;
+                cfg.ssh_listen_ports = new_cfg.ssh_listen_ports.clone();
 
                 last_cfg_reload = std::time::Instant::now();
             }
@@ -1082,6 +1212,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
 
         // 1) read events (fast)
+        let ssh_listen_ports_set: HashSet<u16> = cfg.ssh_listen_ports.iter().copied().collect();
         while let Some(item) = ringbuf_cmd.next() {
             if item.len() < core::mem::size_of::<CommandEvent>() {
                 continue;
@@ -1103,6 +1234,19 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 comm,
             );
             ae.line = Some(line);
+            if let Some(ip) = ssh_client_ip_by_tgid
+                .get(&ev.tgid)
+                .cloned()
+                .or_else(|| {
+                    let ip = resolve_ssh_client_ip_for_shell(ev.pid, &ssh_listen_ports_set);
+                    if let Some(ref s) = ip {
+                        ssh_client_ip_by_tgid.insert(ev.tgid, s.clone());
+                    }
+                    ip
+                })
+            {
+                ae.ssh_client_ip = Some(ip);
+            }
             batcher.push(ae);
         }
 

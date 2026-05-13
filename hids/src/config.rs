@@ -66,6 +66,10 @@ pub struct Config {
     /// 文件监控路径（非空则启用 inotify 类监听）；建议配置关键目录如 `/etc`、`/var/www`。
     pub file_watch_paths: Vec<String>,
 
+    /// SSH 服务监听端口列表（用于 bash 事件关联客户端 IP：`event_kind=0` 的 `ssh_client_ip`）。
+    /// 非默认端口多个时请在此列出（如 `[22, 2222]`）。
+    pub ssh_listen_ports: Vec<u16>,
+
     /// 是否启用 TLS 明文观测（OpenSSL `SSL_write` / `SSL_read` uprobe）。
     pub tls_monitor_enabled: bool,
     /// 要附加的 OpenSSL 动态库路径。`auto` 表示自动探测 `libssl.so`。
@@ -111,6 +115,7 @@ struct PartialConfig {
 
     proc_monitor_enabled: Option<bool>,
     file_watch_paths: Option<Vec<String>>,
+    ssh_listen_ports: Option<Vec<u16>>,
     tls_monitor_enabled: Option<bool>,
     tls_libssl_path: Option<String>,
     tls_target_comm: Option<String>,
@@ -164,6 +169,8 @@ impl Config {
             // 默认关闭：exec/exit 事件量极大，生产请按需开启或通过 JSON/env 打开。
             proc_monitor_enabled: false,
             file_watch_paths: Vec::new(),
+
+            ssh_listen_ports: vec![22],
 
             tls_monitor_enabled: false,
             tls_libssl_path: "auto".to_string(),
@@ -311,6 +318,19 @@ impl Config {
             }
         }
 
+        // env: HIDS_SSH_LISTEN_PORTS=22,2222
+        if let Ok(v) = std::env::var("HIDS_SSH_LISTEN_PORTS") {
+            let mut ports = Vec::new();
+            for p in v.split(',') {
+                if let Ok(pp) = p.trim().parse::<u16>() {
+                    ports.push(pp);
+                }
+            }
+            if !ports.is_empty() {
+                cfg.ssh_listen_ports = ports;
+            }
+        }
+
         cfg.tls_monitor_enabled = std::env::var("HIDS_TLS_MONITOR_ENABLED")
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
@@ -397,6 +417,9 @@ impl Config {
         }
         if let Some(v) = partial.file_watch_paths {
             self.file_watch_paths = v;
+        }
+        if let Some(v) = partial.ssh_listen_ports {
+            self.ssh_listen_ports = v;
         }
         if let Some(v) = partial.tls_monitor_enabled {
             self.tls_monitor_enabled = v;
