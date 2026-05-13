@@ -542,8 +542,22 @@ impl HttpL7Runtime {
         }
     }
 
-    /// 若应丢弃该 URL（静态资源等），返回 true。
-    pub fn should_drop_url(&self, url: &str) -> bool {
+    /// 若应丢弃该 **入站请求**（静态资源等），返回 true。
+    ///
+    /// 安全约束：不丢弃 `POST`/`PUT`/`PATCH`/`DELETE`；不丢弃 URL 中带 `?` 的
+    /// `GET`/`HEAD`（query 中常见注入）；`CONNECT` 等非常规方法也不按静态后缀丢。
+    pub fn should_drop_request_url(&self, method: &str, url: &str) -> bool {
+        let m = method.trim().to_ascii_uppercase();
+        match m.as_str() {
+            "POST" | "PUT" | "PATCH" | "DELETE" => return false,
+            "GET" | "HEAD" => {
+                if url.contains('?') {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+
         let path = url.split('?').next().unwrap_or(url);
         let path_lc = path.to_ascii_lowercase();
         for p in &self.ignore_path_prefixes {
@@ -559,6 +573,59 @@ impl HttpL7Runtime {
         }
         false
     }
+}
+
+/// 取 HTTP 报文头块（不含首行体），用于解析 `Content-Type`。
+fn http_header_text(payload: &[u8]) -> Option<String> {
+    let end = find_bytes(payload, b"\r\n\r\n")?;
+    Some(String::from_utf8_lossy(&payload[..end]).into_owned())
+}
+
+fn parse_http_header_value_lc(headers: &str, name: &str) -> Option<String> {
+    for line in headers.split("\r\n") {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case(name) {
+            return Some(v.trim().to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn main_content_type(ct: &str) -> &str {
+    ct.split(';').next().unwrap_or(ct).trim()
+}
+
+/// 出站 TLS/HTTP 响应：高置信度静态资源（不丢 `text/html` / `application/json` / `image/svg+xml`）。
+fn is_static_asset_response_content_type(ct: &str) -> bool {
+    let m = main_content_type(ct);
+    if m.starts_with("image/") {
+        return m != "image/svg+xml";
+    }
+    m.starts_with("font/")
+        || m.starts_with("video/")
+        || m.starts_with("audio/")
+        || m == "text/css"
+        || m == "application/javascript"
+        || m == "text/javascript"
+        || m == "application/x-javascript"
+        || m == "application/wasm"
+        || m == "application/vnd.ms-fontobject"
+}
+
+fn should_drop_plaintext_http_static_response(payload: &[u8]) -> bool {
+    let Some(hdr) = http_header_text(payload) else {
+        return false;
+    };
+    let Some(ct) = parse_http_header_value_lc(&hdr, "content-type") else {
+        return false;
+    };
+    is_static_asset_response_content_type(&ct)
 }
 
 /// 与 XDP flow（入站 SYN）及 HTTP 请求对齐的关联键：客户端 -> 服务端。
@@ -705,7 +772,7 @@ fn spawn_http_sniffer(
                         Ok(g) => g,
                         Err(_) => continue,
                     };
-                    if rt.should_drop_url(&url) {
+                    if rt.should_drop_request_url(&method, &url) {
                         continue;
                     }
                 }
@@ -752,6 +819,12 @@ fn spawn_http_sniffer(
                     continue;
                 };
                 let text = String::from_utf8_lossy(payload);
+                let text_lc = text.to_ascii_lowercase();
+                if should_drop_plaintext_http_static_response(payload)
+                    && detect_sqli_keyword(&text_lc).is_none()
+                {
+                    continue;
+                }
                 let body_trunc = if let Some(idx) = text.find("\r\n\r\n") {
                     sanitize_text_200(&text[idx + 4..])
                 } else {
@@ -1344,6 +1417,16 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         continue;
                     }
 
+                    let payload_lc = payload_raw.to_ascii_lowercase();
+                    // 出站完整 TLS 明文响应：去掉 favicon/图片/字体等高置信度静态体（不丢 svg、不丢含 SQLi 线索的报文）。
+                    if ev.direction != 1
+                        && parse_http_response_status(&msg).is_some()
+                        && should_drop_plaintext_http_static_response(&msg)
+                        && detect_sqli_keyword(&payload_lc).is_none()
+                    {
+                        continue;
+                    }
+
                     let mut ae = base_event(
                         7,
                         now_ms,
@@ -1365,7 +1448,6 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     }
 
                     // Fill HTTP semantic fields if possible (so server can index/query easily).
-                    let payload_lc = payload_raw.to_ascii_lowercase();
                     let threat = detect_sqli_keyword(&payload_lc);
                     ae.tls_threat = threat;
 
@@ -1375,7 +1457,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         // Reuse the same static ignore rules as HTTP L7 sniffer (if available).
                         let drop = if let Some(rt) = http_l7_runtime.as_ref() {
                             rt.read()
-                                .map(|g| g.should_drop_url(&url))
+                                .map(|g| g.should_drop_request_url(&method, &url))
                                 .unwrap_or(false)
                         } else {
                             false
@@ -1417,6 +1499,31 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     let looks_h2_preface = chunk_raw.starts_with("PRI * HTTP/2.0");
                     if looks_http_req || looks_http_resp || looks_h2_preface {
                         if payload_hits_target_port(&chunk_raw, cfg.tls_target_port) {
+                            if looks_http_resp
+                                && ev.direction != 1
+                                && should_drop_plaintext_http_static_response(&ev.data[..n])
+                                && detect_sqli_keyword(&chunk_lc).is_none()
+                            {
+                                continue;
+                            }
+
+                            if looks_http_req {
+                                if let Some((ref method, ref url, _, _, _)) =
+                                    parse_http_request_details(&ev.data[..n])
+                                {
+                                    let drop_req = if let Some(rt) = http_l7_runtime.as_ref() {
+                                        rt.read()
+                                            .map(|g| g.should_drop_request_url(method, url))
+                                            .unwrap_or(false)
+                                    } else {
+                                        false
+                                    };
+                                    if drop_req {
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let mut ae = base_event(
                                 7,
                                 now_ms,

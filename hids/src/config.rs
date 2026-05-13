@@ -162,6 +162,13 @@ impl Config {
                 ".woff".to_string(),
                 ".woff2".to_string(),
                 ".map".to_string(),
+                ".png".to_string(),
+                ".jpg".to_string(),
+                ".jpeg".to_string(),
+                ".gif".to_string(),
+                ".webp".to_string(),
+                ".ttf".to_string(),
+                ".eot".to_string(),
             ],
 
             http_l7_capture_response: true,
