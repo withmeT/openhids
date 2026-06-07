@@ -1,0 +1,69 @@
+{
+  "index_patterns": ["hids-events-*", "hids-alerts-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.lifecycle.name": "hids-events-policy",
+      "index.lifecycle.rollover_alias": "hids-events"
+    },
+    "mappings": {
+      "dynamic": true,
+      "date_detection": true,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "ingest_ts_ms": { "type": "long" },
+        "ingest_time": { "type": "keyword" },
+        "ingest_time_iso": { "type": "date" },
+        "event_time": { "type": "keyword" },
+        "event_time_iso": { "type": "date" },
+        "ts_ms": { "type": "long" },
+        "event_kind": { "type": "byte" },
+        "host_id": { "type": "keyword" },
+        "agent_version": { "type": "keyword" },
+        "schema_version": { "type": "integer" },
+        "client_ip": { "type": "ip", "ignore_malformed": true },
+        "server_ip": { "type": "ip", "ignore_malformed": true },
+        "correlation_key": { "type": "keyword" },
+        "flow_src_ip": { "type": "ip", "ignore_malformed": true },
+        "flow_dst_ip": { "type": "ip", "ignore_malformed": true },
+        "flow_dst_port": { "type": "integer" },
+        "ssh_client_ip": { "type": "ip", "ignore_malformed": true },
+        "http_method": { "type": "keyword" },
+        "http_url": { "type": "keyword", "ignore_above": 2048 },
+        "http_status": { "type": "short" },
+        "threat": {
+          "properties": {
+            "level": { "type": "keyword" },
+            "score": { "type": "integer" },
+            "categories": { "type": "keyword" },
+            "model_version": { "type": "keyword" },
+            "rules": {
+              "type": "nested",
+              "properties": {
+                "id": { "type": "keyword" },
+                "severity": { "type": "keyword" },
+                "category": { "type": "keyword" }
+              }
+            },
+            "context": {
+              "properties": {
+                "ssh_client_ip": { "type": "ip", "ignore_malformed": true }
+              }
+            }
+          }
+        },
+        "hids": {
+          "properties": {
+            "pipeline": { "type": "keyword" },
+            "batch_event_count": { "type": "integer" }
+          }
+        }
+      }
+    }
+  },
+  "priority": 200,
+  "_meta": {
+    "description": "HIDS agent events and alerts (ingest_v2)"
+  }
+}

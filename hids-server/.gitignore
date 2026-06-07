@@ -1,0 +1,3 @@
+/target/
+/spool-server/
+.env

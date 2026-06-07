@@ -90,6 +90,15 @@ pub struct AgentEvent {
     pub tls_threat: Option<String>,
 }
 
+/// Agent 上报时的内存队列压力（便于服务端/运维观察背压）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentStats {
+    pub pending_batches: usize,
+    pub pending_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_pending_files: Option<usize>,
+}
+
 /// 一次 HTTP 发送的“批次包裹层”，用于携带版本信息并保持事件数组不变。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestEnvelope {
@@ -97,6 +106,8 @@ pub struct IngestEnvelope {
     pub schema_version: u32,
     #[serde(default)]
     pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stats: Option<AgentStats>,
     pub events: Vec<AgentEvent>,
 }
 

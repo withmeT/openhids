@@ -1,2 +1,5 @@
 [target."cfg(all())"]
 runner = "sudo -E"
+
+# 默认使用 hids/ebpf/hids.bpf（或 target 里已有 out/hids），无需联网编 eBPF。
+# 修改 hids-ebpf 后重编：AYA_BUILD_EBPF=1 cargo build --release

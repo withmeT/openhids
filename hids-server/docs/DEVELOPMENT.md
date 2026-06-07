@@ -10,9 +10,13 @@
 |------|------|
 | HTTP 入口 | `POST /ingest`，请求体为 `{ "events": [ ... ] }`，数组内每项为一条 **Agent 事件**（JSON object）。 |
 | ES 写入 | 每条 `events[]` 对应 bulk 中 **一行 `index` + 一行文档**；与客户端是否批量发送无关。 |
-| 时间戳 | 若文档中无 `ingest_ts_ms`，服务端在入队前补充 **Unix 毫秒**（表示服务端接收时间）；已有则不改写。 |
-| 配置 | 通过 `.env` / 环境变量（`BIND_ADDR`、`ES_URL`、`ES_INDEX`、认证、队列与 bulk 参数等）。 |
-| 威胁预处理 | 入队前写入根字段 **`threat`**（`level` / `score` / `categories` / `rules` / `model_version`）；规则见 `src/threat/rules.rs`，SYN 短窗计数见 `src/threat/aggregate.rs`。 |
+| 时间戳 | **`@timestamp`**（优先 `event_time_iso`）、`ingest_ts_ms` / `ts_ms`、中国时间展示字段 `ingest_time` / `event_time`（及 `*_iso`）。 |
+| 关联字段 | **`client_ip`**、**`server_ip`**、**`correlation_key`**（归一化，便于 ES 聚合与 JOIN）。 |
+| 配置 | `.env.example`：`ES_DAILY_INDEX`、`ES_ALERTS_*`、`THREAT_RULES_PATH`、`FLOW_DROP_PLAIN_SYN` 等。 |
+| 威胁预处理 | 内置规则 `src/threat/rules.rs` + 可选 YAML `rules/threat-rules.yaml`；`threat.level >= low` 镜像到 **`hids-alerts-*`**。 |
+| 可靠性 | ES bulk **重试**（`ES_MAX_RETRIES`）、失败批次 **落盘**（`SPOOL_ON_ES_FAILURE`）、`Ctrl+C` **优雅退出**并 drain 队列。 |
+| 可观测 | `GET /stats` 返回计数器；`GET /healthz` 返回基础状态。 |
+| 幂等 | 默认 `ES_DOCUMENT_ID=true`，按事件内容生成稳定 `_id`（Agent 重试不重复写）。 |
 
 ### 1.1 源码布局（按职责分文件，便于单步调试）
 
@@ -22,7 +26,12 @@
 | `src/lib.rs` | 组装配置、后台 ES 任务、HTTP 服务。 |
 | `src/config.rs` | 从环境变量读取运行参数（含 `THREAT_SYN_*`）。 |
 | `src/models.rs` | `AgentEvent`、`IngestEnvelope`、`THREAT_MODEL_VERSION`。 |
-| `src/enrich.rs` | `ingest_ts_ms` 等服务端富化。 |
+| `src/enrich.rs` | ingest 时间、`client_ip` / `correlation_key` / `@timestamp` 等富化。 |
+| `src/filter.rs` | 可选丢弃纯 SYN flow（`FLOW_DROP_PLAIN_SYN`）。 |
+| `rules/threat-rules.yaml` | 外置威胁规则（需重启加载）。 |
+| `docs/ES_FIELDS.md` | 字段字典与 Kibana 查询示例。 |
+| `docs/INDEX_AND_RETENTION.md` | 索引模板、ILM、spool 重放。 |
+| `scripts/apply-es-template.sh` | 推送 ES template + ILM。 |
 | `src/error.rs` | HTTP 层 `AppError`。 |
 | `src/app.rs` | `AppState`（队列发送端 + `SynBurstTracker`）。 |
 | `src/routes.rs` | `/healthz`、`/ingest` 路由与 handler。 |

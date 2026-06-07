@@ -1,0 +1,35 @@
+# HIDS 服务端威胁规则（热加载需重启进程；版本号写入 threat.model_version）
+version: "hids-threat-0.2.0"
+
+rules:
+  - id: shell_reverse_shell_hint
+    event_kinds: [0]
+    field: line
+    match: regex
+    pattern: "(?i)(/dev/tcp/|nc\\s+-e|bash\\s+-i\\s*>\\s*/dev/tcp)"
+    severity: high
+    category: shell
+
+  - id: shell_download_exec
+    event_kinds: [0]
+    field: line
+    match: regex
+    pattern: "(?i)(curl|wget).*(\\|\\s*sh|\\|\\s*bash)"
+    severity: high
+    category: shell
+
+  - id: web_sqli_hint
+    event_kinds: [7]
+    field: http_url
+    match: regex
+    pattern: "(?i)(union\\s+select|'\\s+or\\s+'1'\\s*=\\s*'1)"
+    severity: medium
+    category: web
+
+  - id: web_path_traversal_hint
+    event_kinds: [7]
+    field: http_url
+    match: contains
+    pattern: "../"
+    severity: medium
+    category: web

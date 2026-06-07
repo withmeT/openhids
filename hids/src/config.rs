@@ -6,6 +6,25 @@ use std::{
 use anyhow::Context as _;
 use serde::Deserialize;
 
+/// 采集策略档位：`full` 全量；`balanced` 推荐生产；`security` 仅高价值安全相关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollectMode {
+    #[default]
+    Full,
+    Balanced,
+    Security,
+}
+
+impl CollectMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "balanced" | "balance" => Self::Balanced,
+            "security" | "secure" => Self::Security,
+            _ => Self::Full,
+        }
+    }
+}
+
 /// 运行时配置（启动加载）。
 ///
 /// 目标：把散落在 agent 主循环里的 `HIDS_*` 环境变量读取逻辑集中起来，
@@ -78,6 +97,17 @@ pub struct Config {
     pub tls_target_comm: String,
     /// 仅保留 Host 头含该端口（如 `:18888`）的 HTTPS 请求/响应。
     pub tls_target_port: u16,
+
+    /// 采集档位（见 `apply_collect_mode_presets`）。
+    pub collect_mode: CollectMode,
+    /// 过滤 `ls`/`cd`/`pwd` 等日常交互命令（仍保留高危模式）。
+    pub bash_filter_boring: bool,
+    /// 同一 `(src_ip, dst_port)` SYN 去重窗口（毫秒），`0` 关闭。
+    pub flow_syn_dedup_window_ms: u64,
+    /// 是否上报未重组完整的 TLS 分片（噪声大，生产建议 false）。
+    pub tls_emit_incomplete_chunks: bool,
+    /// 上报 HTTP 响应时的最低状态码（`0`=不限；`400`=仅 4xx/5xx）。
+    pub http_l7_response_min_status: u16,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -120,6 +150,12 @@ struct PartialConfig {
     tls_libssl_path: Option<String>,
     tls_target_comm: Option<String>,
     tls_target_port: Option<u16>,
+
+    collect_mode: Option<String>,
+    bash_filter_boring: Option<bool>,
+    flow_syn_dedup_window_ms: Option<u64>,
+    tls_emit_incomplete_chunks: Option<bool>,
+    http_l7_response_min_status: Option<u16>,
 }
 
 impl Config {
@@ -183,6 +219,12 @@ impl Config {
             tls_libssl_path: "auto".to_string(),
             tls_target_comm: "nginx".to_string(),
             tls_target_port: 18888,
+
+            collect_mode: CollectMode::Full,
+            bash_filter_boring: false,
+            flow_syn_dedup_window_ms: 0,
+            tls_emit_incomplete_chunks: true,
+            http_l7_response_min_status: 0,
         };
 
         // Optional config file (JSON)
@@ -195,6 +237,9 @@ impl Config {
             let partial: PartialConfig = serde_json::from_str(&raw)
                 .with_context(|| format!("parse json config file {config_path}"))?;
             cfg.apply_partial(partial);
+            if cfg.collect_mode != CollectMode::Full {
+                cfg.apply_collect_mode_presets();
+            }
         }
 
         // Env override (host_id has higher priority than config file)
@@ -348,7 +393,48 @@ impl Config {
             .and_then(|v| u16::try_from(v).ok())
             .unwrap_or(cfg.tls_target_port);
 
+        if let Ok(v) = std::env::var("HIDS_COLLECT_MODE") {
+            cfg.collect_mode = CollectMode::parse(&v);
+            cfg.apply_collect_mode_presets();
+        }
+
+        cfg.bash_filter_boring = std::env::var("HIDS_BASH_FILTER_BORING")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.bash_filter_boring);
+        cfg.flow_syn_dedup_window_ms = parse_env_u64("HIDS_FLOW_SYN_DEDUP_WINDOW_MS")
+            .unwrap_or(cfg.flow_syn_dedup_window_ms);
+        cfg.tls_emit_incomplete_chunks = std::env::var("HIDS_TLS_EMIT_INCOMPLETE")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(cfg.tls_emit_incomplete_chunks);
+        cfg.http_l7_response_min_status = std::env::var("HIDS_HTTP_L7_RESPONSE_MIN_STATUS")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(cfg.http_l7_response_min_status);
+
         Ok(cfg)
+    }
+
+    /// 按 `collect_mode` 设置一组推荐默认值（可被 JSON/env 显式字段覆盖后再调用一次）。
+    pub fn apply_collect_mode_presets(&mut self) {
+        match self.collect_mode {
+            CollectMode::Full => {}
+            CollectMode::Balanced => {
+                self.bash_filter_boring = true;
+                self.http_l7_capture_response = false;
+                self.tls_emit_incomplete_chunks = false;
+                self.flow_syn_dedup_window_ms = 1_000;
+                self.http_l7_response_min_status = 400;
+            }
+            CollectMode::Security => {
+                self.bash_filter_boring = true;
+                self.http_l7_capture_response = false;
+                self.tls_emit_incomplete_chunks = false;
+                self.flow_syn_dedup_window_ms = 2_000;
+                self.http_l7_response_min_status = 400;
+            }
+        }
     }
 
     fn apply_partial(&mut self, partial: PartialConfig) {
@@ -439,6 +525,21 @@ impl Config {
         }
         if let Some(v) = partial.tls_target_port {
             self.tls_target_port = v;
+        }
+        if let Some(v) = partial.collect_mode {
+            self.collect_mode = CollectMode::parse(&v);
+        }
+        if let Some(v) = partial.bash_filter_boring {
+            self.bash_filter_boring = v;
+        }
+        if let Some(v) = partial.flow_syn_dedup_window_ms {
+            self.flow_syn_dedup_window_ms = v;
+        }
+        if let Some(v) = partial.tls_emit_incomplete_chunks {
+            self.tls_emit_incomplete_chunks = v;
+        }
+        if let Some(v) = partial.http_l7_response_min_status {
+            self.http_l7_response_min_status = v;
         }
     }
 }

@@ -38,6 +38,12 @@ impl Spool {
         Ok(path)
     }
 
+    pub fn pending_file_count(&self) -> usize {
+        self.list_files_oldest_first()
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
     pub fn list_files_oldest_first(&self) -> io::Result<Vec<PathBuf>> {
         let mut items: Vec<(SystemTime, PathBuf)> = Vec::new();
         if !self.dir.exists() {

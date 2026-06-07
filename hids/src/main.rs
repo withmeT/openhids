@@ -1,5 +1,7 @@
 mod agent;
+mod collect_policy;
 mod config;
+mod tls_flow;
 mod batcher;
 mod events;
 mod http_client;

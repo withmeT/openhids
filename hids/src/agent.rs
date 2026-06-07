@@ -20,11 +20,13 @@ use pnet_packet::tcp::TcpPacket;
 
 use crate::{
     batcher::Batcher,
+    collect_policy,
     config::Config,
-    events::{AgentEvent, IngestEnvelope},
+    events::{AgentEvent, AgentStats, IngestEnvelope},
     features::file_change,
     http_client::drain_spool,
     spool::Spool,
+    tls_flow::{self, TlsFlowResolver},
     utils::cstr_from_fixed,
 };
 
@@ -203,27 +205,6 @@ fn be_u32_to_ipv4_str(ip_be: u32) -> String {
     format!("{a}.{b}.{c}.{d}")
 }
 
-#[derive(Debug, Clone)]
-struct TcpSocketTuple {
-    local_ip: String,
-    local_port: u16,
-    remote_ip: String,
-    remote_port: u16,
-}
-
-fn parse_socket_inode_from_fd(tgid: u32, fd: i32) -> Option<u64> {
-    if fd < 0 {
-        return None;
-    }
-    let path = format!("/proc/{tgid}/fd/{fd}");
-    let link = fs::read_link(path).ok()?;
-    let text = link.to_string_lossy();
-    let start = text.find("socket:[")?;
-    let rem = &text[start + "socket:[".len()..];
-    let end = rem.find(']')?;
-    rem[..end].parse::<u64>().ok()
-}
-
 fn parse_ipv4_hex_le(hex8: &str) -> Option<String> {
     if hex8.len() != 8 {
         return None;
@@ -234,47 +215,6 @@ fn parse_ipv4_hex_le(hex8: &str) -> Option<String> {
     let b3 = ((raw >> 16) & 0xff) as u8;
     let b4 = ((raw >> 24) & 0xff) as u8;
     Some(format!("{b1}.{b2}.{b3}.{b4}"))
-}
-
-fn resolve_tcp_tuple_by_inode(tgid: u32, inode: u64) -> Option<TcpSocketTuple> {
-    // Prefer per-process net namespace view; fallback to host-wide.
-    let candidates = [format!("/proc/{tgid}/net/tcp"), "/proc/net/tcp".to_string()];
-    for p in candidates {
-        let text = fs::read_to_string(&p).ok()?;
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 {
-                continue;
-            }
-            let local = cols[1];
-            let remote = cols[2];
-            let inode_col = cols[9];
-            let Some(row_inode) = inode_col.parse::<u64>().ok() else {
-                continue;
-            };
-            if row_inode != inode {
-                continue;
-            }
-            let (lip_hex, lport_hex) = local.split_once(':')?;
-            let (rip_hex, rport_hex) = remote.split_once(':')?;
-            let local_ip = parse_ipv4_hex_le(lip_hex)?;
-            let remote_ip = parse_ipv4_hex_le(rip_hex)?;
-            let local_port = u16::from_str_radix(lport_hex, 16).ok()?;
-            let remote_port = u16::from_str_radix(rport_hex, 16).ok()?;
-            return Some(TcpSocketTuple {
-                local_ip,
-                local_port,
-                remote_ip,
-                remote_port,
-            });
-        }
-    }
-    None
-}
-
-fn resolve_tls_socket_tuple(tgid: u32, fd: i32) -> Option<TcpSocketTuple> {
-    let inode = parse_socket_inode_from_fd(tgid, fd)?;
-    resolve_tcp_tuple_by_inode(tgid, inode)
 }
 
 /// `/proc/net/tcp` 状态列（十六进制），`01` = TCP_ESTABLISHED。
@@ -402,22 +342,6 @@ fn resolve_ssh_client_ip_for_shell(shell_pid: u32, listen_ports: &HashSet<u16>) 
     ssh_client_ipv4_from_sshd(sshd, listen_ports)
 }
 
-fn fill_tls_flow_fields(ae: &mut AgentEvent, tuple: &TcpSocketTuple, tls_direction: u8) {
-    // For server-side TLS (nginx), local is usually server and remote is client.
-    ae.flow_src_ip = Some(tuple.remote_ip.clone());
-    ae.flow_src_port = Some(tuple.remote_port);
-    ae.flow_dst_ip = Some(tuple.local_ip.clone());
-    ae.flow_dst_port = Some(tuple.local_port);
-    ae.flow_proto = Some(6);
-    ae.flow_direction = Some(if tls_direction == 1 { 1 } else { 2 });
-    ae.flow_correlation_key = Some(tcp_flow_correlation_key(
-        &tuple.remote_ip,
-        tuple.remote_port,
-        &tuple.local_ip,
-        tuple.local_port,
-    ));
-}
-
 fn detect_local_ipv4s() -> Vec<String> {
     // best-effort: hostname -I is common on linux.
     let out = std::process::Command::new("hostname")
@@ -530,6 +454,7 @@ struct HttpL7Runtime {
     pub ignore_path_prefixes: Vec<String>,
     pub ignore_path_suffixes: Vec<String>,
     pub capture_response: bool,
+    pub response_min_status: u16,
 }
 
 impl HttpL7Runtime {
@@ -539,6 +464,7 @@ impl HttpL7Runtime {
             ignore_path_prefixes: cfg.http_l7_ignore_path_prefixes.clone(),
             ignore_path_suffixes: cfg.http_l7_ignore_path_suffixes.clone(),
             capture_response: cfg.http_l7_capture_response,
+            response_min_status: cfg.http_l7_response_min_status,
         }
     }
 
@@ -626,11 +552,6 @@ fn should_drop_plaintext_http_static_response(payload: &[u8]) -> bool {
         return false;
     };
     is_static_asset_response_content_type(&ct)
-}
-
-/// 与 XDP flow（入站 SYN）及 HTTP 请求对齐的关联键：客户端 -> 服务端。
-fn tcp_flow_correlation_key(src_ip: &str, src_port: u16, dst_ip: &str, dst_port: u16) -> String {
-    format!("tcp:{}:{}->{}:{}", src_ip, src_port, dst_ip, dst_port)
 }
 
 fn parse_http_request_details(payload: &[u8]) -> Option<(String, String, Option<String>, Option<String>, String)> {
@@ -818,6 +739,20 @@ fn spawn_http_sniffer(
                 let Some(status) = parse_http_response_status(payload) else {
                     continue;
                 };
+                let min_status = {
+                    let rt = match runtime.read() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    rt.response_min_status
+                };
+                if !collect_policy::should_emit_http_response(
+                    status,
+                    true,
+                    min_status,
+                ) {
+                    continue;
+                };
                 let text = String::from_utf8_lossy(payload);
                 let text_lc = text.to_ascii_lowercase();
                 if should_drop_plaintext_http_static_response(payload)
@@ -961,8 +896,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let agent_version: String = AGENT_VERSION.to_string();
 
     println!(
-        "hids agent start: version={} schema_version={}",
-        AGENT_VERSION, schema_version
+        "hids agent start: version={} schema_version={} collect_mode={:?}",
+        AGENT_VERSION, schema_version, cfg.collect_mode
     );
 
     // disk spool budget: <= 100MB as requested
@@ -989,7 +924,20 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let mut ringbuf_cmd = RingBuf::try_from(events_map)?;
 
     let mut ringbuf_tls = None;
+    let mut tls_flow_resolver = None;
+    let mut tls_ssl_fd_map: Option<AyaHashMap<_, tls_flow::TlsFdKeyPod, i32>> = None;
     if cfg.tls_monitor_enabled {
+        let mut tls_ports: HashSet<u16> = cfg.http_l7_ports.iter().copied().collect();
+        tls_ports.insert(cfg.tls_target_port);
+        tls_flow_resolver = Some(TlsFlowResolver::new(tls_ports));
+
+        if let Some(map_data) = bpf.take_map("TLS_SSL_FD") {
+            if let Ok(map) = AyaHashMap::try_from(map_data) {
+                tls_ssl_fd_map = Some(map);
+                eprintln!("hids: TLS_SSL_FD map ready (ssl_ptr -> socket fd)");
+            }
+        }
+
         let libssl_path = detect_libssl_path(&cfg.tls_libssl_path)
             .ok_or_else(|| anyhow::anyhow!("libssl path not found; set tls_libssl_path"))?;
 
@@ -1198,11 +1146,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
     type HttpDedupKey = (String, String, u16, u16, String);
     let mut http_dedup: HashMap<HttpDedupKey, u64> = HashMap::new();
     let mut last_http_dedup_prune = Instant::now();
+    let mut flow_syn_dedup: HashMap<(String, u16), u64> = HashMap::new();
 
     // TLS 明文流式拼接（最佳努力）：按 (tgid, direction) 拼接连续的 SSL_read/write 片段，
     // 尝试重组出完整的 HTTP/1.x 请求/响应（Content-Length 场景优先）。
     let mut tls_streams: HashMap<TlsStreamKey, TlsStreamBuf> = HashMap::new();
     let mut last_tls_streams_prune = Instant::now();
+    let mut last_tls_flow_prune = Instant::now();
 
     // bash `tgid` -> 已解析的 SSH 客户端 IPv4（同一 shell 会话内避免重复扫 /proc）。
     let mut ssh_client_ip_by_tgid: HashMap<u32, String> = HashMap::new();
@@ -1242,6 +1192,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 cfg.http_l7_ignore_path_suffixes = new_cfg.http_l7_ignore_path_suffixes.clone();
                 cfg.http_l7_ports = new_cfg.http_l7_ports.clone();
                 cfg.http_l7_capture_response = new_cfg.http_l7_capture_response;
+                cfg.http_l7_response_min_status = new_cfg.http_l7_response_min_status;
+                cfg.collect_mode = new_cfg.collect_mode;
+                cfg.bash_filter_boring = new_cfg.bash_filter_boring;
+                cfg.flow_syn_dedup_window_ms = new_cfg.flow_syn_dedup_window_ms;
+                cfg.tls_emit_incomplete_chunks = new_cfg.tls_emit_incomplete_chunks;
                 cfg.tls_target_comm = new_cfg.tls_target_comm.clone();
                 cfg.tls_target_port = new_cfg.tls_target_port;
 
@@ -1259,6 +1214,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 .saturating_mul(10)
                 .max(60_000);
             http_dedup.retain(|_, ts| now_ms.saturating_sub(*ts) < max_age);
+            flow_syn_dedup.retain(|_, ts| now_ms.saturating_sub(*ts) < max_age);
             last_http_dedup_prune = Instant::now();
         }
 
@@ -1284,6 +1240,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
             last_tls_streams_prune = Instant::now();
         }
 
+        if let Some(resolver) = tls_flow_resolver.as_mut() {
+            if last_tls_flow_prune.elapsed() >= Duration::from_secs(60) {
+                resolver.prune(Duration::from_secs(300));
+                last_tls_flow_prune = Instant::now();
+            }
+        }
+
         // 1) read events (fast)
         let ssh_listen_ports_set: HashSet<u16> = cfg.ssh_listen_ports.iter().copied().collect();
         while let Some(item) = ringbuf_cmd.next() {
@@ -1306,7 +1269,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 ev.pid,
                 comm,
             );
-            ae.line = Some(line);
+            ae.line = Some(line.clone());
+            if !collect_policy::should_emit_bash_line(&line, cfg.bash_filter_boring) {
+                continue;
+            }
             if let Some(ip) = ssh_client_ip_by_tgid
                 .get(&ev.tgid)
                 .cloned()
@@ -1442,9 +1408,31 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         "ssl_write".to_string()
                     });
                     ae.tls_payload_trunc = Some(sanitize_text_1024(&payload_raw));
-                    ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
-                    if let Some(tuple) = resolve_tls_socket_tuple(ev.tgid, ev.fd) {
-                        fill_tls_flow_fields(&mut ae, &tuple, ev.direction);
+                    if let Some(resolver) = tls_flow_resolver.as_mut() {
+                        let hint = tls_flow::hint_local_port_from_http(&payload_raw);
+                        let mut fd = ev.fd;
+                        if fd < 0 {
+                            if let Some(map) = tls_ssl_fd_map.as_mut() {
+                                let key = tls_flow::TlsFdKeyPod {
+                                    tgid: ev.tgid,
+                                    ssl_ptr: ev.ssl_ptr,
+                                };
+                                if let Ok(stored) = map.get(&key, 0) {
+                                    fd = stored;
+                                }
+                            }
+                        }
+                        resolver.apply_to_event(
+                            &mut ae,
+                            ev.tgid,
+                            ev.pid,
+                            ev.ssl_ptr,
+                            fd,
+                            ev.direction,
+                            hint,
+                        );
+                    } else {
+                        ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
                     }
 
                     // Fill HTTP semantic fields if possible (so server can index/query easily).
@@ -1479,13 +1467,24 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         }
                     }
 
+                    if !collect_policy::should_emit_tls_event(
+                        cfg.collect_mode,
+                        cfg.tls_emit_incomplete_chunks,
+                        true,
+                        ae.http_method.as_deref(),
+                        ae.http_url.as_deref(),
+                        ae.http_status,
+                        ae.tls_threat.as_deref(),
+                    ) {
+                        continue;
+                    }
+
                     batcher.push(ae);
                     emitted = true;
                 }
 
-                // Fallback: if we cannot reconstruct a full HTTP message yet, still emit
-                // current TLS plaintext chunk to avoid silent drops (best-effort visibility).
-                if !emitted {
+                // Fallback: incomplete TLS chunks (high noise; disabled in balanced/security).
+                if !emitted && cfg.tls_emit_incomplete_chunks {
                     let chunk_raw = String::from_utf8_lossy(&ev.data[..n]).to_string();
                     let chunk_lc = chunk_raw.to_ascii_lowercase();
                     let looks_http_req = chunk_lc.starts_with("get ")
@@ -1539,9 +1538,31 @@ pub async fn run() -> Result<(), anyhow::Error> {
                                 "ssl_write".to_string()
                             });
                             ae.tls_payload_trunc = Some(sanitize_text_1024(&chunk_raw));
-                            ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
-                            if let Some(tuple) = resolve_tls_socket_tuple(ev.tgid, ev.fd) {
-                                fill_tls_flow_fields(&mut ae, &tuple, ev.direction);
+                            if let Some(resolver) = tls_flow_resolver.as_mut() {
+                                let hint = tls_flow::hint_local_port_from_http(&chunk_raw);
+                                let mut fd = ev.fd;
+                                if fd < 0 {
+                                    if let Some(map) = tls_ssl_fd_map.as_mut() {
+                                        let key = tls_flow::TlsFdKeyPod {
+                                            tgid: ev.tgid,
+                                            ssl_ptr: ev.ssl_ptr,
+                                        };
+                                        if let Ok(stored) = map.get(&key, 0) {
+                                            fd = stored;
+                                        }
+                                    }
+                                }
+                                resolver.apply_to_event(
+                                    &mut ae,
+                                    ev.tgid,
+                                    ev.pid,
+                                    ev.ssl_ptr,
+                                    fd,
+                                    ev.direction,
+                                    hint,
+                                );
+                            } else {
+                                ae.flow_correlation_key = Some(format!("ssl:{:x}", ev.ssl_ptr));
                             }
                             ae.tls_threat = detect_sqli_keyword(&chunk_lc);
 
@@ -1579,7 +1600,17 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
                 let s_ip = be_u32_to_ipv4_str(ev.src_ip);
                 let d_ip = be_u32_to_ipv4_str(ev.dst_ip);
-                let flow_key = tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
+                if !collect_policy::should_emit_flow_syn(
+                    &s_ip,
+                    ev.dst_port,
+                    cfg.flow_syn_dedup_window_ms,
+                    now_ms,
+                    &mut flow_syn_dedup,
+                ) {
+                    continue;
+                }
+                let flow_key =
+                    tls_flow::tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
 
                 let mut ae = base_event(
                     2,
@@ -1634,11 +1665,25 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     http_dedup.insert(key, now_ms);
                 }
 
+                if ev.is_response {
+                    if let Some(st) = ev.http_status {
+                        if !collect_policy::should_emit_http_response(
+                            st,
+                            cfg.http_l7_capture_response,
+                            cfg.http_l7_response_min_status,
+                        ) {
+                            continue;
+                        }
+                    } else if !cfg.http_l7_capture_response {
+                        continue;
+                    }
+                }
+
                 let flow_key = if ev.is_response {
                     // 出站响应：包内 src=服务端，dst=客户端 → 规范化为 客户端->服务端
-                    tcp_flow_correlation_key(&ev.dst_ip, ev.dst_port, &ev.src_ip, ev.src_port)
+                    tls_flow::tcp_flow_correlation_key(&ev.dst_ip, ev.dst_port, &ev.src_ip, ev.src_port)
                 } else {
-                    tcp_flow_correlation_key(&ev.src_ip, ev.src_port, &ev.dst_ip, ev.dst_port)
+                    tls_flow::tcp_flow_correlation_key(&ev.src_ip, ev.src_port, &ev.dst_ip, ev.dst_port)
                 };
 
                 let mut ae = base_event(
@@ -1718,6 +1763,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 agent_version: agent_version.clone(),
                 schema_version,
                 host_id: Some(cfg.host_id.clone()),
+                agent_stats: Some(AgentStats {
+                    pending_batches: pending.len(),
+                    pending_bytes,
+                    spool_pending_files: Some(spool.pending_file_count()),
+                }),
                 events: batch,
             };
             let body = serde_json::to_vec(&envelope).unwrap_or_default();
@@ -1738,6 +1788,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         agent_version: agent_version.clone(),
                         schema_version,
                         host_id: Some(cfg.host_id.clone()),
+                        agent_stats: Some(AgentStats {
+                            pending_batches: pending.len(),
+                            pending_bytes,
+                            spool_pending_files: Some(spool.pending_file_count()),
+                        }),
                         events: old,
                     };
                     let bytes = serde_json::to_vec(&old_env).unwrap_or_default();

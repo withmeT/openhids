@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde::de;
 use serde_json::Value;
 
-/// Threat ruleset version embedded in each document for replay and tuning.
+/// Built-in threat ruleset version (when YAML rules are disabled).
 pub const THREAT_MODEL_VERSION: &str = "hids-threat-0.1.0";
 
 /// One HIDS event document in Elasticsearch (one bulk `index` action per value).
@@ -28,7 +28,23 @@ impl<'de> Deserialize<'de> for AgentEvent {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Agent batch envelope (`hids` agent `IngestEnvelope` compatible).
+#[derive(Debug, Clone, Deserialize)]
 pub struct IngestEnvelope {
+    #[serde(default)]
+    pub agent_version: Option<String>,
+    #[serde(default)]
+    pub schema_version: Option<u32>,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// Agent-side queue pressure snapshot (optional).
+    #[serde(default)]
+    pub agent_stats: Option<Value>,
     pub events: Vec<AgentEvent>,
+}
+
+impl IngestEnvelope {
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
 }
