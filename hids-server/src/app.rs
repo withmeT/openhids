@@ -1,14 +1,18 @@
 //! Shared application state (queue + threat aggregation handles + event broadcast).
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::Config;
 use crate::metrics::IngestMetrics;
 use crate::models::AgentEvent;
 use crate::threat::aggregate::SynBurstTracker;
 use crate::threat::rules_yaml::Ruleset;
+use hids_protocol::BaselineCommand;
 
 /// 实时事件广播通道容量
 const EVENT_BROADCAST_CAPACITY: usize = 4096;
@@ -29,6 +33,9 @@ pub struct AppState {
     pub es_query_index: String,
     pub es_query_auth: Option<(String, String)>,
     pub es_daily_index: bool,
+    /// Per-host encrypted baseline command queues.
+    pub command_queue: Arc<Mutex<HashMap<String, VecDeque<BaselineCommand>>>>,
+    pub command_key: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -44,6 +51,10 @@ impl AppState {
             (Some(u), Some(p)) => Some((u.clone(), p.clone())),
             _ => None,
         };
+        let command_key = cfg
+            .command_key
+            .as_deref()
+            .and_then(|value| hids_protocol::parse_key(value).ok());
 
         Self {
             tx,
@@ -58,6 +69,8 @@ impl AppState {
             es_query_index: cfg.es_index.clone(),
             es_query_auth,
             es_daily_index: cfg.es_daily_index,
+            command_queue: Arc::new(Mutex::new(HashMap::new())),
+            command_key,
         }
     }
 }

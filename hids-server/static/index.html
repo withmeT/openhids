@@ -82,6 +82,7 @@ tr:hover { background: #1a4080; }
         <option value="5">Exit</option>
         <option value="6">File</option>
         <option value="7">TLS</option>
+        <option value="8">Baseline</option>
       </select>
       <input type="text" id="f-host" placeholder="Host ID">
       <input type="text" id="f-keyword" placeholder="关键字搜索">
@@ -146,6 +147,7 @@ tr:hover { background: #1a4080; }
         <option value="4">Exec</option>
         <option value="6">File</option>
         <option value="7">TLS</option>
+        <option value="8">Baseline</option>
       </select>
       <input type="text" id="ws-host" placeholder="Host ID">
       <label style="font-size:13px;color:#aaa;"><input type="checkbox" id="ws-alerts"> 仅告警</label>
@@ -162,8 +164,8 @@ const PAGE_SIZE = 50;
 let totalEvents = 0;
 let ws = null;
 
-const KIND_MAP = {0:'Bash',2:'Flow',3:'HTTP',4:'Exec',5:'Exit',6:'File',7:'TLS'};
-const KIND_CLASS = {0:'bash',2:'flow',3:'http',4:'exec',5:'exit',6:'file',7:'tls'};
+const KIND_MAP = {0:'Bash',2:'Flow',3:'HTTP',4:'Exec',5:'Exit',6:'File',7:'TLS',8:'Baseline'};
+const KIND_CLASS = {0:'bash',2:'flow',3:'http',4:'exec',5:'exit',6:'file',7:'tls',8:'baseline'};
 
 function switchTab(name) {
   document.querySelectorAll('.nav button').forEach((b,i) => b.classList.remove('active'));
@@ -180,6 +182,7 @@ function eventSummary(ev) {
   if (ev.http_url) return (ev.http_method||'')+ ' ' + ev.http_url;
   if (ev.exec_path) return ev.exec_path + ' ' + (ev.exec_args||[]).join(' ');
   if (ev.file_path) return (ev.file_op||'') + ' ' + ev.file_path;
+  if (ev.baseline_check) return ev.baseline_check + ': ' + (ev.baseline_status||'') + ' ' + (ev.baseline_result||'').substring(0,80);
   if (ev.tls_sni) return ev.tls_sni + ' ' + (ev.tls_payload_trunc||'').substring(0,80);
   if (ev.flow_dst_ip) return ev.flow_src_ip+':'+ev.flow_src_port+' → '+ev.flow_dst_ip+':'+ev.flow_dst_port;
   return '-';

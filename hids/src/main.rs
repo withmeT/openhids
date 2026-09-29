@@ -1,6 +1,8 @@
 mod agent;
+mod baseline;
 mod batcher;
 mod collect_policy;
+mod control;
 mod config;
 mod dedup;
 mod events;

@@ -4,6 +4,7 @@ members = [
     "hids",
     "hids-common",
     "hids-ebpf",
+    "hids-protocol",
 ]
 default-members = ["hids", "hids-common"]
 

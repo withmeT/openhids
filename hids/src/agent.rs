@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use flate2::{Compression, write::GzEncoder};
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::RingBuf;
 use aya::maps::HashMap as AyaHashMap;
@@ -93,6 +94,10 @@ fn base_event(
         tls_direction: None,
         tls_payload_trunc: None,
         tls_threat: None,
+        baseline_request_id: None,
+        baseline_check: None,
+        baseline_status: None,
+        baseline_result: None,
     }
 }
 
@@ -839,10 +844,21 @@ async fn send_envelope(
     client: &reqwest::Client,
     url: &str,
     envelope: &IngestEnvelope,
+    token: &str,
 ) -> anyhow::Result<()> {
-    let res = client
+    let json = serde_json::to_vec(envelope).context("serialize ingest envelope")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    std::io::Write::write_all(&mut encoder, &json).context("compress ingest envelope")?;
+    let body = encoder.finish().context("finish ingest compression")?;
+    let mut request = client
         .post(url)
-        .json(envelope)
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(body);
+    if !token.trim().is_empty() {
+        request = request.header("x-api-key", token.trim());
+    }
+    let res = request
         .send()
         .await
         .context("send http request")?;
@@ -1127,6 +1143,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let mut last_cfg_reload = std::time::Instant::now();
 
     let mut last_spool_drain = std::time::Instant::now();
+    let mut last_command_poll = std::time::Instant::now();
 
     // HTTP L7 去重：使用优化的去重窗口（哈希 key，避免存储完整字符串）
     let mut http_dedup = HttpDedupWindow::new(cfg.http_l7_dedup_window_ms);
@@ -1161,6 +1178,12 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
                 // Keep spool configuration stable during runtime to avoid inconsistencies.
                 cfg.ingest_url = new_cfg.ingest_url;
+                cfg.command_poll_url = new_cfg.command_poll_url;
+                cfg.command_result_url = new_cfg.command_result_url;
+                cfg.command_key = new_cfg.command_key;
+                cfg.command_poll_interval_secs = new_cfg.command_poll_interval_secs;
+                cfg.ingest_token = new_cfg.ingest_token;
+                cfg.baseline_allowed_paths = new_cfg.baseline_allowed_paths;
 
                 mem_queue_max = new_cfg.mem_queue_max_bytes;
                 max_send_batches_per_iter = new_cfg.max_send_batches_per_iter;
@@ -1757,7 +1780,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let body = serde_json::to_vec(&envelope).unwrap_or_default();
             pending_bytes = pending_bytes.saturating_sub(body.len());
 
-            match send_envelope(&client, &cfg.ingest_url, &envelope).await {
+            match send_envelope(&client, &cfg.ingest_url, &envelope, &cfg.ingest_token).await {
                 Ok(()) => {
                     metrics.inc(&metrics.batches_sent);
                 }
@@ -1795,8 +1818,17 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
         // 4) periodically drain spool (if network is back)
         if last_spool_drain.elapsed() >= Duration::from_secs(spool_drain_interval_secs) {
-            let _ = drain_spool(&client, &cfg.ingest_url, &spool).await;
+            let _ = drain_spool(&client, &cfg.ingest_url, &cfg.ingest_token, &spool).await;
             last_spool_drain = std::time::Instant::now();
+        }
+
+        if last_command_poll.elapsed()
+            >= Duration::from_secs(cfg.command_poll_interval_secs.max(1))
+        {
+            if let Err(err) = crate::control::poll_once(&client, &cfg).await {
+                eprintln!("baseline control-plane poll failed: {err}");
+            }
+            last_command_poll = std::time::Instant::now();
         }
 
         // 5) 定期打印性能指标（每 60 秒）
@@ -1809,4 +1841,3 @@ pub async fn run() -> Result<(), anyhow::Error> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
-

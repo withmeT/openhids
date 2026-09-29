@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// 单条从 eBPF ringbuf 拉取到用户态的“命令事件”，随后会被 batch/压缩后发送到接收端。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
-    /// 事件类型：0=bash 命令行，1=预留，2=flow，3=HTTP L7，4=execve，5=进程退出，6=文件变更，7=TLS 明文
+    /// 事件类型：0=bash，2=flow，3=HTTP，4=execve，5=exit，6=file，7=TLS，8=baseline
     pub event_kind: u8,
     pub ts_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +88,16 @@ pub struct AgentEvent {
     /// event_kind=7：命中的威胁类型（如 `sqli_keyword`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_threat: Option<String>,
+
+    /// event_kind=8：基线检查结果。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_check: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_result: Option<String>,
 }
 
 /// Agent 上报时的内存队列压力（便于服务端/运维观察背压）。
@@ -110,4 +120,3 @@ pub struct IngestEnvelope {
     pub agent_stats: Option<AgentStats>,
     pub events: Vec<AgentEvent>,
 }
-

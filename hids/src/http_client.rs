@@ -4,15 +4,27 @@ use crate::{
 };
 
 use anyhow::Context as _;
+use flate2::{Compression, write::GzEncoder};
 
 async fn send_envelope(
     client: &reqwest::Client,
     url: &str,
     envelope: &IngestEnvelope,
+    token: &str,
 ) -> anyhow::Result<()> {
-    let res = client
+    let json = serde_json::to_vec(envelope).context("serialize ingest envelope")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    std::io::Write::write_all(&mut encoder, &json).context("compress ingest envelope")?;
+    let body = encoder.finish().context("finish ingest compression")?;
+    let mut request = client
         .post(url)
-        .json(envelope)
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(body);
+    if !token.trim().is_empty() {
+        request = request.header("x-api-key", token.trim());
+    }
+    let res = request
         .send()
         .await
         .context("send http request")?;
@@ -28,6 +40,7 @@ async fn send_envelope(
 pub async fn drain_spool(
     client: &reqwest::Client,
     url: &str,
+    token: &str,
     spool: &Spool,
 ) -> anyhow::Result<()> {
     let files = spool.list_files_oldest_first().unwrap_or_default();
@@ -44,7 +57,7 @@ pub async fn drain_spool(
             }
         };
 
-        if send_envelope(client, url, &envelope).await.is_ok() {
+        if send_envelope(client, url, &envelope, token).await.is_ok() {
             let _ = std::fs::remove_file(&f);
         } else {
             // network/server still bad; stop here
@@ -55,4 +68,3 @@ pub async fn drain_spool(
 }
 
 // Intentionally no extra helpers for now; sending is handled inline in `agent.rs`.
-

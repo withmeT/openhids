@@ -10,6 +10,7 @@ pub enum AppError {
     BadRequest(String),
     Unauthorized,
     QueueFull,
+    CommandQueueFull,
 }
 
 impl IntoResponse for AppError {
@@ -24,6 +25,11 @@ impl IntoResponse for AppError {
             Self::QueueFull => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ingest queue is full, please retry",
+            )
+                .into_response(),
+            Self::CommandQueueFull => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "command queue is full, please retry",
             )
                 .into_response(),
         }

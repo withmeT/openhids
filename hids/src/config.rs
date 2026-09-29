@@ -35,6 +35,16 @@ pub struct Config {
     pub host_id: String,
 
     pub ingest_url: String,
+    /// Optional Bearer/API key for ingest and control-plane HTTP requests.
+    pub ingest_token: String,
+    /// 基线控制面：取任务和回传结果的地址。
+    pub command_poll_url: String,
+    pub command_result_url: String,
+    /// 32 字节预共享密钥（hex 或 base64），空值表示关闭基线控制面。
+    pub command_key: String,
+    pub command_poll_interval_secs: u64,
+    /// 允许基线检查计算哈希的路径前缀，避免服务端借控制面读取任意文件。
+    pub baseline_allowed_paths: Vec<String>,
 
     pub flush_bytes: usize,
     pub flush_interval_ms: u64,
@@ -115,6 +125,12 @@ struct PartialConfig {
     host_id: Option<String>,
 
     ingest_url: Option<String>,
+    ingest_token: Option<String>,
+    command_poll_url: Option<String>,
+    command_result_url: Option<String>,
+    command_key: Option<String>,
+    command_poll_interval_secs: Option<u64>,
+    baseline_allowed_paths: Option<Vec<String>>,
 
     flush_bytes: Option<usize>,
     flush_interval_ms: Option<u64>,
@@ -164,6 +180,18 @@ impl Config {
         let mut cfg = Self {
             host_id: detect_host_id(),
             ingest_url: "http://127.0.0.1:8000/ingest".to_string(),
+            ingest_token: String::new(),
+            command_poll_url: "http://127.0.0.1:8000/commands/next".to_string(),
+            command_result_url: "http://127.0.0.1:8000/commands/result".to_string(),
+            command_key: String::new(),
+            command_poll_interval_secs: 15,
+            baseline_allowed_paths: vec![
+                "/etc".to_string(),
+                "/usr/bin".to_string(),
+                "/usr/sbin".to_string(),
+                "/bin".to_string(),
+                "/sbin".to_string(),
+            ],
 
             flush_bytes: 1 * 1024 * 1024,
             flush_interval_ms: 2_000,
@@ -249,6 +277,28 @@ impl Config {
 
         // Env overrides
         cfg.ingest_url = std::env::var("HIDS_INGEST_URL").unwrap_or(cfg.ingest_url);
+        cfg.ingest_token = std::env::var("HIDS_INGEST_TOKEN")
+            .or_else(|_| std::env::var("HIDS_API_KEY"))
+            .unwrap_or(cfg.ingest_token);
+        cfg.command_poll_url =
+            std::env::var("HIDS_COMMAND_POLL_URL").unwrap_or(cfg.command_poll_url);
+        cfg.command_result_url =
+            std::env::var("HIDS_COMMAND_RESULT_URL").unwrap_or(cfg.command_result_url);
+        cfg.command_key = std::env::var("HIDS_COMMAND_KEY").unwrap_or(cfg.command_key);
+        cfg.command_poll_interval_secs = parse_env_u64("HIDS_COMMAND_POLL_INTERVAL_SECS")
+            .unwrap_or(cfg.command_poll_interval_secs)
+            .max(1);
+        if let Ok(v) = std::env::var("HIDS_BASELINE_ALLOWED_PATHS") {
+            let paths: Vec<String> = v
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !paths.is_empty() {
+                cfg.baseline_allowed_paths = paths;
+            }
+        }
 
         cfg.flush_bytes = parse_env_usize("HIDS_FLUSH_BYTES").unwrap_or(cfg.flush_bytes);
         cfg.flush_interval_ms =
@@ -444,6 +494,24 @@ impl Config {
         if let Some(v) = partial.ingest_url {
             self.ingest_url = v;
         }
+        if let Some(v) = partial.ingest_token {
+            self.ingest_token = v;
+        }
+        if let Some(v) = partial.command_poll_url {
+            self.command_poll_url = v;
+        }
+        if let Some(v) = partial.command_result_url {
+            self.command_result_url = v;
+        }
+        if let Some(v) = partial.command_key {
+            self.command_key = v;
+        }
+        if let Some(v) = partial.command_poll_interval_secs {
+            self.command_poll_interval_secs = v.max(1);
+        }
+        if let Some(v) = partial.baseline_allowed_paths {
+            self.baseline_allowed_paths = v;
+        }
         if let Some(v) = partial.flush_bytes {
             self.flush_bytes = v;
         }
@@ -569,4 +637,3 @@ fn detect_host_id() -> String {
     // Fallback: env HOSTNAME (often set in container) or "unknown".
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
-

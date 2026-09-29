@@ -1,6 +1,18 @@
 {
   "host_id": null,
   "ingest_url": "http://127.0.0.1:8000/ingest",
+  "ingest_token": "",
+  "command_poll_url": "http://127.0.0.1:8000/commands/next",
+  "command_result_url": "http://127.0.0.1:8000/commands/result",
+  "command_key": "",
+  "command_poll_interval_secs": 15,
+  "baseline_allowed_paths": [
+    "/etc",
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin"
+  ],
   "collect_mode": "balanced",
   "flush_bytes": 1048576,
   "flush_interval_ms": 2000,

@@ -101,6 +101,7 @@ pub struct Config {
     pub spool_dir: PathBuf,
     pub spool_enabled: bool,
     pub ingest_token: Option<String>,
+    pub command_key: Option<String>,
     pub max_body_bytes: usize,
 }
 
@@ -152,6 +153,9 @@ impl Config {
             ),
             spool_enabled: read_bool("SPOOL_ON_ES_FAILURE", true),
             ingest_token: ingest_token_from_env(),
+            command_key: std::env::var("HIDS_COMMAND_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             max_body_bytes: max_body_mb.saturating_mul(1024 * 1024),
         }
     }

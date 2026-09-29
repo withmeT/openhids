@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 hids-common = { path = "../hids-common", features = ["user"] }
+hids-protocol = { path = "../hids-protocol" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -29,6 +30,8 @@ tokio = { workspace = true, features = [
 pnet_datalink = "0.35"
 pnet_packet = "0.35"
 notify = "6"
+flate2 = "1"
+sha2 = "0.10"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

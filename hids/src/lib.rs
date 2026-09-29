@@ -1,6 +1,8 @@
 pub mod agent;
+pub mod baseline;
 pub mod batcher;
 pub mod collect_policy;
+pub mod control;
 pub mod config;
 pub mod dedup;
 pub mod events;
