@@ -9,15 +9,19 @@ pub mod es_writer;
 pub mod filter;
 pub mod metrics;
 pub mod models;
+pub mod query;
 pub mod routes;
 pub mod spool;
 pub mod threat;
 pub mod time_fmt;
+pub mod ws;
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info};
 
@@ -72,7 +76,15 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     let state = AppState::new(&cfg, tx.clone(), syn_tracker, ruleset, metrics);
-    let app = routes::router(state).layer(RequestBodyLimitLayer::new(cfg.max_body_bytes));
+    let app = routes::router(state)
+        .layer(CompressionLayer::new())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .layer(RequestBodyLimitLayer::new(cfg.max_body_bytes));
 
     info!(
         "listening on http://{} (queue={}, es_index={}, alerts={}, daily_index={}, doc_id={}, spool={}, flow_drop_syn={})",

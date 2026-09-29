@@ -1,4 +1,6 @@
-//! HTTP routes (`/healthz`, `/stats`, `/ingest`).
+//! HTTP routes (`/healthz`, `/stats`, `/ingest`, `/events/*`, `/alerts`, `/hosts`, `/ws/events`).
+
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -6,6 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use tower_http::services::{ServeDir, ServeFile};
 use tokio::sync::mpsc;
 
 use crate::app::AppState;
@@ -14,13 +17,29 @@ use crate::error::AppError;
 use crate::filter;
 use crate::metrics::MetricsSnapshot;
 use crate::models::IngestEnvelope;
+use crate::query;
 use crate::threat;
+use crate::ws;
 
 pub fn router(state: AppState) -> Router {
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".to_string());
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/ingest", post(ingest))
+        // 查询 API
+        .route("/events/search", get(query::events_search))
+        .route("/events/recent", get(query::events_recent))
+        .route("/alerts", get(query::alerts_search))
+        .route("/hosts", get(query::hosts_list))
+        // WebSocket 实时推送
+        .route("/ws/events", get(ws::ws_events))
+        // 静态前端文件
+        .fallback_service(
+            ServeDir::new(&static_dir)
+                .fallback(ServeFile::new(format!("{}/index.html", static_dir))),
+        )
         .with_state(state)
 }
 
@@ -80,6 +99,10 @@ async fn ingest(
 
         let mut ev = enrich::enrich_event(ev, &meta);
         threat::analyze_event(&mut ev, &state.syn_tracker, state.ruleset.as_ref());
+
+        // 广播到 WebSocket 订阅者
+        let _ = state.event_broadcast.send(Arc::new(ev.0.clone()));
+
         state
             .tx
             .try_send(ev)

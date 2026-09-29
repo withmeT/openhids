@@ -1,15 +1,17 @@
 mod agent;
+mod batcher;
 mod collect_policy;
 mod config;
-mod tls_flow;
-mod batcher;
+mod dedup;
 mod events;
-mod http_client;
-mod spool;
-mod utils;
-
-// feature placeholders (future development)
 mod features;
+mod http_client;
+mod metrics;
+mod proc_cache;
+mod spool;
+mod string_utils;
+mod tls_flow;
+mod utils;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {

@@ -20,6 +20,7 @@ pub fn should_emit_bash_line(line: &str, filter_boring: bool) -> bool {
 }
 
 /// 是否上报 XDP flow（当前内核仅 SYN + 敏感端口；此处做同源去重）。
+#[allow(dead_code)]
 pub fn should_emit_flow_syn(
     src_ip: &str,
     dst_port: u16,

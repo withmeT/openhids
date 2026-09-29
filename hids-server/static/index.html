@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HIDS Console</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+.header { background: #16213e; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #0f3460; }
+.header h1 { font-size: 18px; color: #00d4ff; }
+.header .status { font-size: 12px; color: #666; }
+.header .status.connected { color: #4caf50; }
+.nav { display: flex; background: #16213e; border-bottom: 1px solid #0f3460; }
+.nav button { background: none; border: none; color: #aaa; padding: 10px 20px; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+.nav button.active { color: #00d4ff; border-bottom-color: #00d4ff; }
+.nav button:hover { color: #fff; }
+.container { padding: 16px 24px; }
+.filters { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+.filters input, .filters select { background: #0f3460; border: 1px solid #1a4080; color: #eee; padding: 6px 12px; border-radius: 4px; font-size: 13px; }
+.filters input { width: 200px; }
+.filters button { background: #00d4ff; color: #1a1a2e; border: none; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
+.filters button:hover { background: #00b8d4; }
+.filters .btn-ws { background: #4caf50; }
+.filters .btn-ws.active { background: #f44336; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #1a4080; }
+th { background: #0f3460; color: #00d4ff; position: sticky; top: 0; }
+tr:hover { background: #1a4080; }
+.badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 500; }
+.badge-high { background: #f44336; color: #fff; }
+.badge-medium { background: #ff9800; color: #fff; }
+.badge-low { background: #ffc107; color: #333; }
+.badge-none { background: #333; color: #888; }
+.badge-bash { background: #9c27b0; color: #fff; }
+.badge-flow { background: #2196f3; color: #fff; }
+.badge-http { background: #4caf50; color: #fff; }
+.badge-exec { background: #ff5722; color: #fff; }
+.badge-exit { background: #607d8b; color: #fff; }
+.badge-file { background: #795548; color: #fff; }
+.badge-tls { background: #00bcd4; color: #fff; }
+.table-wrap { max-height: calc(100vh - 220px); overflow-y: auto; }
+.pagination { display: flex; gap: 10px; align-items: center; margin-top: 12px; justify-content: center; }
+.pagination button { background: #0f3460; border: 1px solid #1a4080; color: #eee; padding: 4px 12px; border-radius: 4px; cursor: pointer; }
+.pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+.pagination span { font-size: 13px; color: #aaa; }
+.hosts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.host-card { background: #0f3460; border: 1px solid #1a4080; border-radius: 6px; padding: 14px; }
+.host-card h3 { font-size: 14px; color: #00d4ff; margin-bottom: 6px; word-break: break-all; }
+.host-card p { font-size: 12px; color: #aaa; }
+.empty { text-align: center; padding: 40px; color: #666; }
+#live-panel { display: none; }
+#live-log { font-family: 'Courier New', monospace; font-size: 12px; background: #0a0a1a; border: 1px solid #1a4080; border-radius: 4px; padding: 10px; height: calc(100vh - 260px); overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+.log-line { padding: 2px 0; border-bottom: 1px solid #111; }
+.log-line:hover { background: #1a1a3e; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>HIDS Console</h1>
+  <span id="ws-status" class="status">未连接</span>
+</div>
+
+<div class="nav">
+  <button class="active" onclick="switchTab('events')">事件</button>
+  <button onclick="switchTab('alerts')">告警</button>
+  <button onclick="switchTab('hosts')">主机</button>
+  <button onclick="switchTab('live')">实时</button>
+</div>
+
+<div class="container">
+  <!-- 事件面板 -->
+  <div id="events-panel">
+    <div class="filters">
+      <select id="f-kind">
+        <option value="">全部类型</option>
+        <option value="0">Bash</option>
+        <option value="2">Flow</option>
+        <option value="3">HTTP</option>
+        <option value="4">Exec</option>
+        <option value="5">Exit</option>
+        <option value="6">File</option>
+        <option value="7">TLS</option>
+      </select>
+      <input type="text" id="f-host" placeholder="Host ID">
+      <input type="text" id="f-keyword" placeholder="关键字搜索">
+      <select id="f-threat">
+        <option value="">全部级别</option>
+        <option value="high">高危</option>
+        <option value="medium">中危</option>
+        <option value="low">低危</option>
+      </select>
+      <input type="text" id="f-ip" placeholder="客户端 IP">
+      <button onclick="searchEvents()">搜索</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>主机</th><th>威胁</th><th>摘要</th></tr></thead>
+        <tbody id="events-body"></tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <button id="prev-btn" onclick="prevPage()" disabled>&lt; 上一页</button>
+      <span id="page-info">-</span>
+      <button id="next-btn" onclick="nextPage()">下一页 &gt;</button>
+    </div>
+  </div>
+
+  <!-- 告警面板 -->
+  <div id="alerts-panel" style="display:none">
+    <div class="filters">
+      <select id="a-level">
+        <option value="">全部级别</option>
+        <option value="high">高危</option>
+        <option value="medium">中危</option>
+        <option value="low">低危</option>
+      </select>
+      <input type="text" id="a-host" placeholder="Host ID">
+      <button onclick="searchAlerts()">搜索</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>级别</th><th>类型</th><th>主机</th><th>规则</th><th>摘要</th></tr></thead>
+        <tbody id="alerts-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 主机面板 -->
+  <div id="hosts-panel" style="display:none">
+    <div class="filters">
+      <button onclick="loadHosts()">刷新</button>
+    </div>
+    <div class="hosts-grid" id="hosts-grid"></div>
+  </div>
+
+  <!-- 实时面板 -->
+  <div id="live-panel" style="display:none">
+    <div class="filters">
+      <select id="ws-kind">
+        <option value="">全部类型</option>
+        <option value="0">Bash</option>
+        <option value="2">Flow</option>
+        <option value="3">HTTP</option>
+        <option value="4">Exec</option>
+        <option value="6">File</option>
+        <option value="7">TLS</option>
+      </select>
+      <input type="text" id="ws-host" placeholder="Host ID">
+      <label style="font-size:13px;color:#aaa;"><input type="checkbox" id="ws-alerts"> 仅告警</label>
+      <button class="btn-ws" id="ws-btn" onclick="toggleWs()">连接</button>
+    </div>
+    <div id="live-log"></div>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+let currentPage = 0;
+const PAGE_SIZE = 50;
+let totalEvents = 0;
+let ws = null;
+
+const KIND_MAP = {0:'Bash',2:'Flow',3:'HTTP',4:'Exec',5:'Exit',6:'File',7:'TLS'};
+const KIND_CLASS = {0:'bash',2:'flow',3:'http',4:'exec',5:'exit',6:'file',7:'tls'};
+
+function switchTab(name) {
+  document.querySelectorAll('.nav button').forEach((b,i) => b.classList.remove('active'));
+  ['events','alerts','hosts','live'].forEach(t => {
+    document.getElementById(t+'-panel').style.display = (t===name)?'block':'none';
+  });
+  event.target.classList.add('active');
+  if (name==='hosts') loadHosts();
+  if (name==='alerts') searchAlerts();
+}
+
+function eventSummary(ev) {
+  if (ev.line) return ev.line.substring(0,120);
+  if (ev.http_url) return (ev.http_method||'')+ ' ' + ev.http_url;
+  if (ev.exec_path) return ev.exec_path + ' ' + (ev.exec_args||[]).join(' ');
+  if (ev.file_path) return (ev.file_op||'') + ' ' + ev.file_path;
+  if (ev.tls_sni) return ev.tls_sni + ' ' + (ev.tls_payload_trunc||'').substring(0,80);
+  if (ev.flow_dst_ip) return ev.flow_src_ip+':'+ev.flow_src_port+' → '+ev.flow_dst_ip+':'+ev.flow_dst_port;
+  return '-';
+}
+
+function threatBadge(ev) {
+  const level = ev.threat && ev.threat.level ? ev.threat.level : 'none';
+  const labels = {high:'高危',medium:'中危',low:'低危',none:'-'};
+  return `<span class="badge badge-${level}">${labels[level]||level}</span>`;
+}
+
+function kindBadge(kind) {
+  const name = KIND_MAP[kind] || kind;
+  const cls = KIND_CLASS[kind] || 'none';
+  return `<span class="badge badge-${cls}">${name}</span>`;
+}
+
+function fmtTime(ts) {
+  if (!ts) return '-';
+  try { return new Date(ts).toLocaleString('zh-CN',{hour12:false}); } catch(e) { return ts; }
+}
+
+async function searchEvents() {
+  currentPage = 0;
+  await loadEvents();
+}
+
+async function loadEvents() {
+  const params = new URLSearchParams();
+  const kind = document.getElementById('f-kind').value;
+  const host = document.getElementById('f-host').value;
+  const kw = document.getElementById('f-keyword').value;
+  const threat = document.getElementById('f-threat').value;
+  const ip = document.getElementById('f-ip').value;
+  if (kind) params.set('event_kind', kind);
+  if (host) params.set('host_id', host);
+  if (kw) params.set('keyword', kw);
+  if (threat) params.set('threat_level', threat);
+  if (ip) params.set('client_ip', ip);
+  params.set('size', PAGE_SIZE);
+  params.set('from_offset', currentPage * PAGE_SIZE);
+
+  try {
+    const r = await fetch(`${API}/events/search?${params}`);
+    const data = await r.json();
+    totalEvents = data.total || 0;
+    renderEvents(data.events || []);
+    updatePagination();
+  } catch(e) {
+    document.getElementById('events-body').innerHTML = `<tr><td colspan="5" class="empty">查询失败: ${e.message}</td></tr>`;
+  }
+}
+
+function renderEvents(events) {
+  const tbody = document.getElementById('events-body');
+  if (!events.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">暂无数据</td></tr>';
+    return;
+  }
+  tbody.innerHTML = events.map(ev => `<tr>
+    <td>${fmtTime(ev['@timestamp'])}</td>
+    <td>${kindBadge(ev.event_kind)}</td>
+    <td title="${ev.host_id||''}">${(ev.host_id||'').substring(0,16)}</td>
+    <td>${threatBadge(ev)}</td>
+    <td title="${eventSummary(ev)}">${eventSummary(ev).substring(0,100)}</td>
+  </tr>`).join('');
+}
+
+function updatePagination() {
+  const totalPages = Math.ceil(totalEvents / PAGE_SIZE);
+  document.getElementById('page-info').textContent = totalEvents > 0 ? `第 ${currentPage+1}/${totalPages} 页 (共 ${totalEvents} 条)` : '无数据';
+  document.getElementById('prev-btn').disabled = currentPage <= 0;
+  document.getElementById('next-btn').disabled = (currentPage+1) >= totalPages;
+}
+
+function prevPage() { if(currentPage>0){currentPage--;loadEvents();} }
+function nextPage() { currentPage++; loadEvents(); }
+
+async function searchAlerts() {
+  const params = new URLSearchParams();
+  const level = document.getElementById('a-level').value;
+  const host = document.getElementById('a-host').value;
+  if(level) params.set('level',level);
+  if(host) params.set('host_id',host);
+  params.set('size','100');
+
+  try {
+    const r = await fetch(`${API}/alerts?${params}`);
+    const data = await r.json();
+    const tbody = document.getElementById('alerts-body');
+    const events = data.events||[];
+    if(!events.length) { tbody.innerHTML='<tr><td colspan="6" class="empty">暂无告警</td></tr>'; return; }
+    tbody.innerHTML = events.map(ev => `<tr>
+      <td>${fmtTime(ev['@timestamp'])}</td>
+      <td>${threatBadge(ev)}</td>
+      <td>${kindBadge(ev.event_kind)}</td>
+      <td>${(ev.host_id||'').substring(0,16)}</td>
+      <td>${ev.threat&&ev.threat.rule_id?ev.threat.rule_id:'-'}</td>
+      <td>${eventSummary(ev).substring(0,80)}</td>
+    </tr>`).join('');
+  } catch(e) {
+    document.getElementById('alerts-body').innerHTML = `<tr><td colspan="6" class="empty">查询失败</td></tr>`;
+  }
+}
+
+async function loadHosts() {
+  try {
+    const r = await fetch(`${API}/hosts`);
+    const data = await r.json();
+    const grid = document.getElementById('hosts-grid');
+    const hosts = data.hosts||[];
+    if(!hosts.length) { grid.innerHTML='<div class="empty">暂无主机数据</div>'; return; }
+    grid.innerHTML = hosts.map(h => `<div class="host-card">
+      <h3>${h.host_id}</h3>
+      <p>事件数: ${h.event_count||0}</p>
+      <p>最后上报: ${fmtTime(h.last_seen)}</p>
+    </div>`).join('');
+  } catch(e) {
+    document.getElementById('hosts-grid').innerHTML = `<div class="empty">加载失败</div>`;
+  }
+}
+
+function toggleWs() {
+  if(ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+    return;
+  }
+  const params = new URLSearchParams();
+  const kind = document.getElementById('ws-kind').value;
+  const host = document.getElementById('ws-host').value;
+  const alerts = document.getElementById('ws-alerts').checked;
+  if(kind) params.set('event_kinds',kind);
+  if(host) params.set('host_id',host);
+  if(alerts) params.set('alerts_only','true');
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/events?${params}`);
+  ws.onopen = () => {
+    document.getElementById('ws-btn').textContent = '断开';
+    document.getElementById('ws-btn').classList.add('active');
+    document.getElementById('ws-status').textContent = '已连接';
+    document.getElementById('ws-status').classList.add('connected');
+  };
+  ws.onclose = () => {
+    document.getElementById('ws-btn').textContent = '连接';
+    document.getElementById('ws-btn').classList.remove('active');
+    document.getElementById('ws-status').textContent = '未连接';
+    document.getElementById('ws-status').classList.remove('connected');
+  };
+  ws.onmessage = (e) => {
+    const log = document.getElementById('live-log');
+    try {
+      const ev = JSON.parse(e.data);
+      const time = fmtTime(ev['@timestamp']);
+      const kind = KIND_MAP[ev.event_kind]||ev.event_kind;
+      const host = (ev.host_id||'').substring(0,12);
+      const summary = eventSummary(ev).substring(0,120);
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.textContent = `[${time}] [${kind}] [${host}] ${summary}`;
+      log.appendChild(line);
+      if(log.children.length > 500) log.removeChild(log.firstChild);
+      log.scrollTop = log.scrollHeight;
+    } catch(err) {
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.textContent = e.data;
+      log.appendChild(line);
+    }
+  };
+}
+
+// 初始加载
+searchEvents();
+</script>
+</body>
+</html>

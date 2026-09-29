@@ -19,15 +19,18 @@ use pnet_packet::ipv4::Ipv4Packet;
 use pnet_packet::tcp::TcpPacket;
 
 use crate::{
-    batcher::Batcher,
+    batcher::{estimate_event_bytes, Batcher},
     collect_policy,
     config::Config,
+    dedup::{FlowSynDedupWindow, HttpDedupKey, HttpDedupWindow},
     events::{AgentEvent, AgentStats, IngestEnvelope},
     features::file_change,
     http_client::drain_spool,
+    metrics::AgentMetrics,
+    proc_cache::{LocalIpsCache, SshClientCache, SshdAncestorCache},
     spool::Spool,
+    string_utils::{cstr_from_fixed, sanitize_text_200, sanitize_text_1024, sanitize_text_n},
     tls_flow::{self, TlsFlowResolver},
-    utils::cstr_from_fixed,
 };
 
 use hids_common::{CommandEvent, ExecEvent, ExitEvent, FlowEvent, TlsEvent, MAX_EXEC_PATH};
@@ -337,11 +340,6 @@ fn ssh_client_ipv4_from_sshd(sshd_pid: u32, listen_ports: &HashSet<u16>) -> Opti
     None
 }
 
-fn resolve_ssh_client_ip_for_shell(shell_pid: u32, listen_ports: &HashSet<u16>) -> Option<String> {
-    let sshd = find_sshd_ancestor(shell_pid)?;
-    ssh_client_ipv4_from_sshd(sshd, listen_ports)
-}
-
 fn detect_local_ipv4s() -> Vec<String> {
     // best-effort: hostname -I is common on linux.
     let out = std::process::Command::new("hostname")
@@ -374,28 +372,7 @@ struct HttpL7Event {
     is_response: bool,
 }
 
-fn sanitize_text_200(s: &str) -> String {
-    sanitize_text_n(s, 200)
-}
-
-fn sanitize_text_1024(s: &str) -> String {
-    sanitize_text_n(s, 1024)
-}
-
-fn sanitize_text_n(s: &str, max_len: usize) -> String {
-    let mut out = String::with_capacity(max_len.min(1024));
-    for ch in s.chars() {
-        if out.len() >= max_len {
-            break;
-        }
-        if ch.is_ascii_graphic() || ch == ' ' {
-            out.push(ch);
-        } else {
-            out.push(' ');
-        }
-    }
-    out.trim().to_string()
-}
+// 已迁移到 string_utils.rs
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TlsStreamKey {
@@ -884,9 +861,14 @@ async fn send_envelope(
 
 pub async fn run() -> Result<(), anyhow::Error> {
     let mut cfg = Config::load()?;
-    let agent_local_ip: Option<String> = detect_local_ipv4s()
-        .into_iter()
-        .find(|ip| ip != "127.0.0.1")
+
+    // 初始化缓存（减少系统调用）
+    let mut local_ips_cache = LocalIpsCache::new(Duration::from_secs(300)); // 5 分钟刷新一次
+    let agent_local_ip: Option<String> = local_ips_cache
+        .get(detect_local_ipv4s)
+        .iter()
+        .find(|ip| ip.as_str() != "127.0.0.1")
+        .cloned()
         .or_else(|| Some("127.0.0.1".to_string()));
 
     const AGENT_VERSION: &str = env!("HIDS_GIT_SHA");
@@ -902,6 +884,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     // disk spool budget: <= 100MB as requested
     let spool = Spool::new(cfg.spool_dir.clone(), cfg.spool_max_bytes);
+
+    // 初始化性能指标
+    let metrics = AgentMetrics::new();
+    let mut last_metrics_log = std::time::Instant::now();
 
     // Built by `hids/build.rs` into OUT_DIR.
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(env!("OUT_DIR"), "/hids")))?;
@@ -1142,11 +1128,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     let mut last_spool_drain = std::time::Instant::now();
 
-    // HTTP L7 去重：相同五元组 + 请求/响应语义标签 在窗口内只上报一次。
-    type HttpDedupKey = (String, String, u16, u16, String);
-    let mut http_dedup: HashMap<HttpDedupKey, u64> = HashMap::new();
-    let mut last_http_dedup_prune = Instant::now();
-    let mut flow_syn_dedup: HashMap<(String, u16), u64> = HashMap::new();
+    // HTTP L7 去重：使用优化的去重窗口（哈希 key，避免存储完整字符串）
+    let mut http_dedup = HttpDedupWindow::new(cfg.http_l7_dedup_window_ms);
+    let mut flow_syn_dedup = FlowSynDedupWindow::new(cfg.flow_syn_dedup_window_ms);
+    let mut last_dedup_prune = Instant::now();
 
     // TLS 明文流式拼接（最佳努力）：按 (tgid, direction) 拼接连续的 SSL_read/write 片段，
     // 尝试重组出完整的 HTTP/1.x 请求/响应（Content-Length 场景优先）。
@@ -1154,8 +1139,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let mut last_tls_streams_prune = Instant::now();
     let mut last_tls_flow_prune = Instant::now();
 
-    // bash `tgid` -> 已解析的 SSH 客户端 IPv4（同一 shell 会话内避免重复扫 /proc）。
-    let mut ssh_client_ip_by_tgid: HashMap<u32, String> = HashMap::new();
+    // SSH 客户端 IP 缓存（带 TTL，避免重复扫描 /proc）
+    let mut ssh_client_cache = SshClientCache::new(Duration::from_secs(300)); // 5 分钟
+    let mut sshd_ancestor_cache = SshdAncestorCache::new(Duration::from_secs(60), 1024); // 1 分钟，最多 1024 条
 
     loop {
         let now_ms = SystemTime::now()
@@ -1188,6 +1174,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 );
 
                 cfg.http_l7_dedup_window_ms = new_cfg.http_l7_dedup_window_ms;
+                http_dedup.update_window(new_cfg.http_l7_dedup_window_ms);
                 cfg.http_l7_ignore_path_prefixes = new_cfg.http_l7_ignore_path_prefixes.clone();
                 cfg.http_l7_ignore_path_suffixes = new_cfg.http_l7_ignore_path_suffixes.clone();
                 cfg.http_l7_ports = new_cfg.http_l7_ports.clone();
@@ -1196,6 +1183,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 cfg.collect_mode = new_cfg.collect_mode;
                 cfg.bash_filter_boring = new_cfg.bash_filter_boring;
                 cfg.flow_syn_dedup_window_ms = new_cfg.flow_syn_dedup_window_ms;
+                flow_syn_dedup.update_window(new_cfg.flow_syn_dedup_window_ms);
                 cfg.tls_emit_incomplete_chunks = new_cfg.tls_emit_incomplete_chunks;
                 cfg.tls_target_comm = new_cfg.tls_target_comm.clone();
                 cfg.tls_target_port = new_cfg.tls_target_port;
@@ -1208,14 +1196,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
 
         // 去重表定期裁剪，避免长期运行内存增长。
-        if last_http_dedup_prune.elapsed() >= Duration::from_secs(60) {
-            let max_age = cfg
-                .http_l7_dedup_window_ms
-                .saturating_mul(10)
-                .max(60_000);
-            http_dedup.retain(|_, ts| now_ms.saturating_sub(*ts) < max_age);
-            flow_syn_dedup.retain(|_, ts| now_ms.saturating_sub(*ts) < max_age);
-            last_http_dedup_prune = Instant::now();
+        if last_dedup_prune.elapsed() >= Duration::from_secs(60) {
+            http_dedup.prune(now_ms);
+            flow_syn_dedup.prune(now_ms);
+            last_dedup_prune = Instant::now();
         }
 
         // TLS 流缓存定期裁剪（避免长期运行/异常流量导致内存增长）。
@@ -1260,6 +1244,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let line = cstr_from_fixed(&ev.line);
             let ts_ms = now_ms;
 
+            metrics.inc(&metrics.events_bash);
+
             let mut ae = base_event(
                 0,
                 ts_ms,
@@ -1273,17 +1259,14 @@ pub async fn run() -> Result<(), anyhow::Error> {
             if !collect_policy::should_emit_bash_line(&line, cfg.bash_filter_boring) {
                 continue;
             }
-            if let Some(ip) = ssh_client_ip_by_tgid
-                .get(&ev.tgid)
-                .cloned()
-                .or_else(|| {
-                    let ip = resolve_ssh_client_ip_for_shell(ev.pid, &ssh_listen_ports_set);
-                    if let Some(ref s) = ip {
-                        ssh_client_ip_by_tgid.insert(ev.tgid, s.clone());
-                    }
-                    ip
-                })
-            {
+            if let Some(ip) = ssh_client_cache.get_or_resolve(ev.tgid, || {
+                metrics.inc(&metrics.ssh_cache_misses);
+                let sshd_pid = sshd_ancestor_cache.get_or_find(ev.pid, || {
+                    find_sshd_ancestor(ev.pid)
+                })?;
+                ssh_client_ipv4_from_sshd(sshd_pid, &ssh_listen_ports_set)
+            }) {
+                metrics.inc(&metrics.ssh_cache_hits);
                 ae.ssh_client_ip = Some(ip);
             }
             batcher.push(ae);
@@ -1308,6 +1291,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     comm,
                 );
                 ae.exec_path = Some(path);
+                metrics.inc(&metrics.events_exec);
                 batcher.push(ae);
             }
         }
@@ -1330,6 +1314,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     comm,
                 );
                 ae.exit_code = Some(ev.exit_code);
+                metrics.inc(&metrics.events_exit);
                 batcher.push(ae);
             }
         }
@@ -1480,6 +1465,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                     }
 
                     batcher.push(ae);
+                    metrics.inc(&metrics.events_tls);
                     emitted = true;
                 }
 
@@ -1600,15 +1586,16 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
                 let s_ip = be_u32_to_ipv4_str(ev.src_ip);
                 let d_ip = be_u32_to_ipv4_str(ev.dst_ip);
-                if !collect_policy::should_emit_flow_syn(
-                    &s_ip,
-                    ev.dst_port,
-                    cfg.flow_syn_dedup_window_ms,
-                    now_ms,
-                    &mut flow_syn_dedup,
-                ) {
+
+                metrics.inc(&metrics.events_flow_raw);
+
+                // 使用优化的去重窗口
+                if flow_syn_dedup.should_drop(&s_ip, ev.dst_port, now_ms) {
+                    metrics.inc(&metrics.flow_dedup_dropped);
                     continue;
                 }
+
+                metrics.inc(&metrics.events_flow_emitted);
                 let flow_key =
                     tls_flow::tcp_flow_correlation_key(&s_ip, ev.src_port, &d_ip, ev.dst_port);
 
@@ -1638,32 +1625,30 @@ pub async fn run() -> Result<(), anyhow::Error> {
         // userspace HTTP L7 events (URL + body trunc)
         if let Some(rx) = http_l7_rx.as_ref() {
             while let Ok(ev) = rx.try_recv() {
-                let window_ms = cfg.http_l7_dedup_window_ms;
-                if window_ms > 0 {
-                    let dedup_tag = if ev.is_response {
-                        format!("RESP:{}", ev.http_status.unwrap_or(0))
-                    } else {
-                        format!(
-                            "REQ:{}:{}|{}",
-                            ev.method,
-                            ev.url,
-                            ev.http_host.as_deref().unwrap_or("")
-                        )
-                    };
-                    let key = (
-                        ev.src_ip.clone(),
-                        ev.dst_ip.clone(),
-                        ev.src_port,
-                        ev.dst_port,
-                        dedup_tag,
+                metrics.inc(&metrics.events_http_raw);
+
+                // 使用优化的哈希去重（避免字符串分配）
+                let should_drop = if ev.is_response {
+                    let key = HttpDedupKey::from_response(
+                        &ev.src_ip, &ev.dst_ip,
+                        ev.src_port, ev.dst_port,
+                        ev.http_status.unwrap_or(0),
                     );
-                    if let Some(&last) = http_dedup.get(&key) {
-                        if now_ms.saturating_sub(last) < window_ms {
-                            continue;
-                        }
-                    }
-                    http_dedup.insert(key, now_ms);
+                    http_dedup.should_drop(key, now_ms)
+                } else {
+                    let key = HttpDedupKey::from_request(
+                        &ev.src_ip, &ev.dst_ip,
+                        ev.src_port, ev.dst_port,
+                        &ev.method, &ev.url,
+                    );
+                    http_dedup.should_drop(key, now_ms)
+                };
+                if should_drop {
+                    metrics.inc(&metrics.http_dedup_dropped);
+                    continue;
                 }
+
+                metrics.inc(&metrics.events_http_emitted);
 
                 if ev.is_response {
                     if let Some(st) = ev.http_status {
@@ -1724,6 +1709,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
         if let Some(fw_rx) = file_watch_rx.as_ref() {
             while let Ok(ev) = fw_rx.try_recv() {
+                metrics.inc(&metrics.events_file);
                 let mut ae = base_event(
                     6,
                     now_ms,
@@ -1742,11 +1728,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
         // 2) flush trigger: size/time/max_events
         if batcher.should_flush() {
             if let Some(batch) = batcher.take_batch() {
-                pending_bytes = pending_bytes.saturating_add(
-                    serde_json::to_vec(&batch)
-                        .map(|b| b.len())
-                        .unwrap_or(0),
-                );
+                // 用 Batcher 自身的字节估算，避免提前序列化
+                let est = batch.iter().map(estimate_event_bytes).sum::<usize>();
+                pending_bytes = pending_bytes.saturating_add(est);
                 pending.push_back(batch);
             }
         }
@@ -1774,16 +1758,21 @@ pub async fn run() -> Result<(), anyhow::Error> {
             pending_bytes = pending_bytes.saturating_sub(body.len());
 
             match send_envelope(&client, &cfg.ingest_url, &envelope).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    metrics.inc(&metrics.batches_sent);
+                }
                 Err(err) => {
+                    metrics.inc(&metrics.batches_failed);
                     eprintln!("send failed: {err}; spooling");
                     let _ = spool.enqueue(&body);
+                    metrics.inc(&metrics.batches_spooled);
                 }
             }
 
             // backpressure: if too much queued in memory, spill oldest to disk
             if pending_bytes > mem_queue_max {
                 if let Some(old) = pending.pop_front() {
+                    metrics.inc(&metrics.mem_overflow_spooled);
                     let old_env = IngestEnvelope {
                         agent_version: agent_version.clone(),
                         schema_version,
@@ -1808,6 +1797,12 @@ pub async fn run() -> Result<(), anyhow::Error> {
         if last_spool_drain.elapsed() >= Duration::from_secs(spool_drain_interval_secs) {
             let _ = drain_spool(&client, &cfg.ingest_url, &spool).await;
             last_spool_drain = std::time::Instant::now();
+        }
+
+        // 5) 定期打印性能指标（每 60 秒）
+        if last_metrics_log.elapsed().as_secs() >= 60 {
+            metrics.log_summary(pending.len());
+            last_metrics_log = std::time::Instant::now();
         }
 
         // idle: no new behavior => no send (batcher empty => no flush)
