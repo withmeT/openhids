@@ -310,14 +310,6 @@ async fn command_result(
 
     let mut accepted = 0usize;
     for item in result.results {
-        let kind = serde_json::to_value(&item.kind)
-            .ok()
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| "unknown".to_string());
-        let status = serde_json::to_value(&item.status)
-            .ok()
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| "unknown".to_string());
         let event = crate::models::AgentEvent(serde_json::json!({
             "event_kind": 8,
             "ts_ms": result.completed_at_ms,
@@ -327,8 +319,8 @@ async fn command_result(
             "comm": "baseline",
             "host_id": result.host_id,
             "baseline_request_id": result.request_id,
-            "baseline_check": kind,
-            "baseline_status": status,
+            "baseline_check": item.kind.as_str(),
+            "baseline_status": item.status.as_str(),
             "baseline_result": serde_json::json!({
                 "summary": item.summary,
                 "details": item.details,

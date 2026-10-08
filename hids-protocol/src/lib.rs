@@ -53,6 +53,18 @@ pub enum BaselineCheckKind {
     FileHashes,
 }
 
+impl BaselineCheckKind {
+    /// Stable wire name, identical to the `snake_case` serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SystemInfo => "system_info",
+            Self::ListeningPorts => "listening_ports",
+            Self::ProcessSummary => "process_summary",
+            Self::FileHashes => "file_hashes",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineResult {
     pub request_id: String,
@@ -77,6 +89,17 @@ pub enum BaselineStatus {
     Ok,
     Failed,
     Rejected,
+}
+
+impl BaselineStatus {
+    /// Stable wire name, identical to the `snake_case` serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 pub fn parse_key(input: &str) -> anyhow::Result<[u8; 32]> {
@@ -197,5 +220,44 @@ mod tests {
         let mut envelope = seal_json(&"secret", &key).expect("seal");
         envelope.ciphertext.push('A');
         assert!(open_json::<String>(&envelope, &key).is_err());
+    }
+
+    #[test]
+    fn as_str_matches_serde_representation() {
+        let kinds = [
+            BaselineCheckKind::SystemInfo,
+            BaselineCheckKind::ListeningPorts,
+            BaselineCheckKind::ProcessSummary,
+            BaselineCheckKind::FileHashes,
+        ];
+        for kind in &kinds {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap().as_str().unwrap(),
+                kind.as_str()
+            );
+        }
+
+        let statuses = [
+            BaselineStatus::Ok,
+            BaselineStatus::Failed,
+            BaselineStatus::Rejected,
+        ];
+        for status in &statuses {
+            assert_eq!(
+                serde_json::to_value(status).unwrap().as_str().unwrap(),
+                status.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected() {
+        let key = [3u8; KEY_LEN];
+        // Highly compressible, so the envelope stays small while the decompressed
+        // JSON lands just past MAX_DECOMPRESSED_BYTES.
+        let payload = "a".repeat(MAX_DECOMPRESSED_BYTES as usize);
+        let envelope = seal_json(&payload, &key).expect("seal");
+        let err = open_json::<String>(&envelope, &key).expect_err("must reject");
+        assert!(err.to_string().contains("decompressed size limit"));
     }
 }

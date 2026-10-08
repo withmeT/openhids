@@ -18,6 +18,7 @@ use hids_protocol::{
 use sha2::{Digest, Sha256};
 
 const MAX_DETAILS: usize = 200;
+const MAX_LINE_CHARS: usize = 512;
 const MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
 
 pub fn execute(command: &BaselineCommand, allowed_paths: &[String]) -> BaselineResult {
@@ -147,8 +148,14 @@ fn file_hashes(
     let mut rejected = 0usize;
     let mut failed = 0usize;
 
+    // Resolve the allow-list once; every candidate path is matched against it.
+    let allowed_prefixes: Vec<std::path::PathBuf> = allowed_paths
+        .iter()
+        .filter_map(|prefix| fs::canonicalize(prefix).ok())
+        .collect();
+
     for path in check.paths.iter().take(64) {
-        let Some(canonical) = allowed_canonical_path(path, allowed_paths) else {
+        let Some(canonical) = allowed_canonical_path(path, &allowed_prefixes) else {
             rejected += 1;
             continue;
         };
@@ -194,26 +201,26 @@ fn file_hashes(
     }
 }
 
-fn allowed_canonical_path(path: &str, allowed_paths: &[String]) -> Option<std::path::PathBuf> {
+fn allowed_canonical_path(
+    path: &str,
+    allowed_prefixes: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
     let target = fs::canonicalize(path).ok()?;
-    allowed_paths.iter().filter_map(|prefix| fs::canonicalize(prefix).ok()).find_map(
-        |prefix| {
-            if target.starts_with(prefix) {
-                Some(target.clone())
-            } else {
-                None
-            }
-        },
-    )
+    allowed_prefixes
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+        .then_some(target)
 }
 
 fn sanitize_line(line: &str) -> String {
-    line.chars()
-        .take(512)
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>()
-        .trim()
-        .to_string()
+    let mut out = String::with_capacity(line.len().min(MAX_LINE_CHARS));
+    for ch in line.chars().take(MAX_LINE_CHARS) {
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    out.truncate(out.trim_end().len());
+    let leading = out.len() - out.trim_start().len();
+    out.drain(..leading);
+    out
 }
 
 fn now_ms() -> u64 {

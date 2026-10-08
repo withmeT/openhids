@@ -14,6 +14,25 @@
 
 ## 构建与运行
 
+推荐使用顶层 `Makefile` 作为日常入口：
+
+```shell
+make help
+make check
+make release
+make run-server
+sudo ./target/release/hids
+```
+
+Agent 默认复用仓库内置的 `hids/ebpf/hids.bpf`。只有修改 `hids-ebpf/`
+后才需要从源码重编 eBPF：
+
+```shell
+make build-ebpf
+```
+
+也可以直接使用 Cargo：
+
 ```shell
 cargo build -p hids --release
 sudo ./target/release/hids
@@ -114,37 +133,34 @@ sudo ./target/release/hids
    - POST 出现 `http_method=http POST`（字段为 `POST`）和 `http_body_trunc`
    - 条件命中时出现 `flow_src_ip`/`flow_dst_ip`
 
-## Cross-compiling on macOS
+## 在 macOS 上交叉编译
 
-Cross compilation should work on both Intel and Apple Silicon Macs.
+Intel 和 Apple Silicon 两种 Mac 都可以交叉编译。
 
 ```shell
 CC=${ARCH}-linux-musl-gcc cargo build --package hids --release \
   --target=${ARCH}-unknown-linux-musl \
   --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/hids` can be
-copied to a Linux server or VM and run there.
 
-## License
+交叉编译产物 `target/${ARCH}-unknown-linux-musl/release/hids` 可以直接拷贝到
+Linux 服务器或虚拟机上运行。
 
-With the exception of eBPF code, hids is distributed under the terms
-of either the [MIT license] or the [Apache License] (version 2.0), at your
-option.
+## 许可证
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+除 eBPF 代码外，hids 以 [MIT 许可证][MIT license] 或
+[Apache 许可证][Apache license]（2.0 版本）分发，由你任选其一。
 
-### eBPF
+除非你另行明确声明，否则按 Apache-2.0 许可证的定义，你有意提交给本 crate 的任何
+贡献都将按上述双许可方式授权，不附加任何额外条款或条件。
 
-All eBPF code is distributed under either the terms of the
-[GNU General Public License, Version 2] or the [MIT license], at your
-option.
+### eBPF 部分
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
+所有 eBPF 代码以 [GNU 通用公共许可证第 2 版][GNU General Public License, Version 2]
+或 [MIT 许可证][MIT license] 分发，由你任选其一。
+
+除非你另行明确声明，否则按 GPL-2 许可证的定义，你有意提交给本项目的任何贡献都将
+按上述双许可方式授权，不附加任何额外条款或条件。
 
 [Apache license]: LICENSE-APACHE
 [MIT license]: LICENSE-MIT

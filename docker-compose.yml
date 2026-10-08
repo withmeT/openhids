@@ -1,0 +1,52 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - hids-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  hids-server:
+    build:
+      context: .
+      dockerfile: hids-server/Dockerfile
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      BIND_ADDR: 0.0.0.0:8000
+      ES_URL: http://elasticsearch:9200
+      STATIC_DIR: /app/static
+      SPOOL_DIR: /var/lib/hids-server/spool
+      AGENT_DOWNLOAD_ENABLED: "true"
+      AGENT_RELEASES_DIR: /app/releases
+      AGENT_CONFIG_ENABLED: "true"
+      AGENT_CONFIG_PATH: /etc/hids/agent-config.json
+      RUST_LOG: info,hids_server=debug
+      # Set these for non-local/demo deployments and copy the token into the agent bootstrap config.
+      # INGEST_TOKEN: change-me
+      # HIDS_COMMAND_KEY: 64-hex-characters-or-32-byte-base64-key
+    ports:
+      - "8000:8000"
+    volumes:
+      - hids-server-spool:/var/lib/hids-server/spool
+      - ./dist:/app/releases:ro
+      - ./hids-server/agent-config.example.json:/etc/hids/agent-config.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  hids-es-data:
+  hids-server-spool:
