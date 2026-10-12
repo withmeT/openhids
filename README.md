@@ -1,3 +1,13 @@
+
+
+
+
+
+
+
+
+
+
 # HIDS — 基于 eBPF 的主机入侵检测系统
 
 一套轻量级主机入侵检测系统（Host-based Intrusion Detection System）：
@@ -167,9 +177,17 @@ CC=${ARCH}-linux-musl-gcc cargo build --package hids --release \
 
 产物 `target/${ARCH}-unknown-linux-musl/release/hids` 可直接拷贝到 Linux 服务器运行。
 
-## 许可证
 
-除 eBPF 代码外，hids 以 [MIT 许可证][MIT license] 或
+
+## 交流与协作
+如果你对本 HIDS 项目感兴趣，想要一起参与开发、讨论技术方案：
+- 方式1：在 [Issues](../../issues) 提交讨论；
+- 方式2：项目 [Discussions](../../discussions) 板块交流；
+- 邮箱：withme00@163.com（技术协作请简要说明你的背景与想法）## 许
+B
+
+## 许可证
+PF 代码外，hids 以 [MIT 许可证][MIT license] 或
 [Apache 许可证][Apache license]（2.0 版本）分发，由你任选其一。
 
 所有 eBPF 代码以 [GNU 通用公共许可证第 2 版][GNU General Public License, Version 2]
