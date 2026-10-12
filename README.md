@@ -183,8 +183,7 @@ CC=${ARCH}-linux-musl-gcc cargo build --package hids --release \
 如果你对本 HIDS 项目感兴趣，想要一起参与开发、讨论技术方案：
 - 方式1：在 [Issues](../../issues) 提交讨论；
 - 方式2：项目 [Discussions](../../discussions) 板块交流；
-- 邮箱：withme00@163.com（技术协作请简要说明你的背景与想法）## 许
-B
+- 邮箱：withme00@163.com（技术协作请简要说明你的背景与想法）
 
 ## 许可证
 PF 代码外，hids 以 [MIT 许可证][MIT license] 或
