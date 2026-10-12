@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HIDS · Security Console</title>
+<style>
+:root {
+  --bg: #0a0e14;
+  --bg-panel: #10151f;
+  --bg-raised: #161d2a;
+  --bg-hover: #1b2432;
+  --border: #1f2937;
+  --border-strong: #2b3648;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --text-faint: #64748b;
+  --accent: #22d3ee;
+  --accent-dim: rgba(34, 211, 238, .12);
+  --green: #34d399;
+  --red: #f87171;
+  --amber: #fbbf24;
+  --yellow: #facc15;
+  --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body { font-family: var(--sans); background: var(--bg); color: var(--text); font-size: 14px; overflow: hidden; }
+
+/* ===== 布局 ===== */
+.shell { display: flex; height: 100vh; }
+.sidebar {
+  width: 216px; flex-shrink: 0; background: var(--bg-panel);
+  border-right: 1px solid var(--border); display: flex; flex-direction: column;
+}
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  height: 56px; flex-shrink: 0; display: flex; align-items: center; gap: 16px;
+  padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--bg-panel);
+}
+.content { flex: 1; overflow-y: auto; padding: 20px 24px; }
+
+/* ===== 侧栏 ===== */
+.brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; }
+.brand .logo {
+  width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+  background: linear-gradient(135deg, #0891b2, #22d3ee);
+  display: flex; align-items: center; justify-content: center;
+}
+.brand .logo svg { width: 18px; height: 18px; }
+.brand .name { font-size: 15px; font-weight: 700; letter-spacing: .04em; }
+.brand .sub { font-size: 10px; color: var(--text-faint); letter-spacing: .14em; text-transform: uppercase; }
+.nav { padding: 8px 10px; flex: 1; }
+.nav-label { font-size: 10px; color: var(--text-faint); letter-spacing: .12em; text-transform: uppercase; padding: 14px 10px 6px; }
+.nav button {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  background: none; border: none; color: var(--text-dim); text-align: left;
+  padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; font-family: inherit;
+  transition: background .12s, color .12s;
+}
+.nav button:hover { background: var(--bg-hover); color: var(--text); }
+.nav button.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+.nav button svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .85; }
+.side-foot { padding: 14px 18px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--text-faint); display: grid; gap: 6px; }
+.side-foot .row { display: flex; justify-content: space-between; align-items: center; }
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--text-faint); }
+.dot.ok { background: var(--green); box-shadow: 0 0 6px rgba(52,211,153,.7); }
+.dot.err { background: var(--red); }
+
+/* ===== 顶栏 ===== */
+.page-title { font-size: 16px; font-weight: 650; letter-spacing: .01em; }
+.topbar .spacer { flex: 1; }
+.ws-pill {
+  display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-dim);
+  padding: 5px 12px; border: 1px solid var(--border); border-radius: 99px; background: var(--bg-raised);
+}
+.clock { font-family: var(--mono); font-size: 12px; color: var(--text-faint); }
+
+/* ===== 通用组件 ===== */
+.panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.panel-title { font-size: 13px; font-weight: 650; color: var(--text); letter-spacing: .02em; }
+.panel-body { padding: 16px 18px; }
+
+.btn {
+  background: var(--bg-raised); border: 1px solid var(--border-strong); color: var(--text);
+  padding: 7px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-family: inherit;
+  transition: border-color .12s, background .12s;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #06252c; font-weight: 650; }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.danger { background: rgba(248,113,113,.14); border-color: rgba(248,113,113,.4); color: var(--red); }
+.btn.sm { padding: 4px 10px; font-size: 12px; border-radius: 6px; }
+
+input[type=text], select {
+  background: var(--bg-raised); border: 1px solid var(--border-strong); color: var(--text);
+  padding: 7px 12px; border-radius: 8px; font-size: 13px; font-family: inherit; outline: none;
+  transition: border-color .12s;
+}
+input[type=text]:focus, select:focus { border-color: var(--accent); }
+input[type=text]::placeholder { color: var(--text-faint); }
+.filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+.filters input[type=text] { width: 180px; }
+.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-dim); cursor: pointer; user-select: none; }
+.check input { accent-color: var(--accent); }
+
+/* ===== 表格 ===== */
+.table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-panel); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  background: var(--bg-raised); color: var(--text-faint); font-size: 11px; font-weight: 650;
+  letter-spacing: .08em; text-transform: uppercase; text-align: left;
+  padding: 10px 14px; position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tbody tr { cursor: pointer; transition: background .1s; }
+tbody tr:hover { background: var(--bg-hover); }
+tbody tr:last-child td { border-bottom: none; }
+td.t-time { font-family: var(--mono); font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+td.t-host { font-family: var(--mono); font-size: 12px; color: var(--text-dim); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td.t-sum { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
+.empty { text-align: center; padding: 48px; color: var(--text-faint); font-size: 13px; }
+
+/* ===== 徽标 ===== */
+.tag {
+  display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 11px;
+  font-weight: 650; letter-spacing: .03em; white-space: nowrap;
+}
+.tag.bash     { background: rgba(192,132,252,.14); color: #c084fc; }
+.tag.flow     { background: rgba(96,165,250,.14);  color: #60a5fa; }
+.tag.http     { background: rgba(52,211,153,.14);  color: #34d399; }
+.tag.exec     { background: rgba(251,146,60,.14);  color: #fb923c; }
+.tag.exit     { background: rgba(148,163,184,.14); color: #94a3b8; }
+.tag.file     { background: rgba(245,158,11,.14);  color: #d4a373; }
+.tag.tls      { background: rgba(34,211,238,.14);  color: #22d3ee; }
+.tag.baseline { background: rgba(129,140,248,.14); color: #818cf8; }
+.tag.none     { background: rgba(100,116,139,.14); color: #64748b; }
+.lvl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.lvl::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.lvl.high   { color: var(--red); }
+.lvl.medium { color: var(--amber); }
+.lvl.low    { color: var(--yellow); }
+.lvl.none   { color: var(--text-faint); }
+.lvl.none::before { opacity: .4; }
+
+/* ===== 概览 ===== */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 16px; }
+.stat { padding: 16px 18px; position: relative; overflow: hidden; }
+.stat .label { font-size: 11px; color: var(--text-faint); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 8px; }
+.stat .value { font-size: 28px; font-weight: 700; font-family: var(--mono); line-height: 1.1; }
+.stat .foot { font-size: 11.5px; color: var(--text-faint); margin-top: 6px; }
+.stat .glow { position: absolute; right: -24px; top: -24px; width: 90px; height: 90px; border-radius: 50%; opacity: .14; filter: blur(4px); }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+@media (max-width: 1100px) { .grid-2 { grid-template-columns: 1fr; } }
+.bar-row { display: grid; grid-template-columns: 84px 1fr 64px; gap: 12px; align-items: center; margin-bottom: 10px; font-size: 12.5px; }
+.bar-row .n { font-family: var(--mono); text-align: right; color: var(--text-dim); }
+.bar-track { height: 8px; border-radius: 99px; background: var(--bg-raised); overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 99px; background: var(--accent); transition: width .5s ease; min-width: 0; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 2px 20px; }
+.metric { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px dashed var(--border); font-size: 12.5px; }
+.metric b { font-family: var(--mono); font-weight: 600; }
+.metric span { color: var(--text-faint); }
+
+/* ===== 主机 ===== */
+.hosts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }
+.host-card { padding: 16px 18px; transition: border-color .12s; }
+.host-card:hover { border-color: var(--accent); }
+.host-card .hid { font-family: var(--mono); font-size: 13px; font-weight: 650; color: var(--accent); word-break: break-all; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+.host-card .meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-dim); padding: 4px 0; }
+.host-card .meta b { font-family: var(--mono); color: var(--text); font-weight: 600; }
+
+/* ===== 实时流 ===== */
+.live-log {
+  font-family: var(--mono); font-size: 12.5px; background: #070b11;
+  border: 1px solid var(--border); border-radius: 12px;
+  height: calc(100vh - 230px); overflow-y: auto; padding: 10px 0;
+}
+.log-line { display: flex; gap: 10px; padding: 3px 14px; border-left: 2px solid transparent; align-items: baseline; }
+.log-line:hover { background: var(--bg-hover); }
+.log-line.threat-high { border-left-color: var(--red); background: rgba(248,113,113,.05); }
+.log-line.threat-medium { border-left-color: var(--amber); }
+.log-line .lt { color: var(--text-faint); flex-shrink: 0; }
+.log-line .lh { color: var(--text-dim); flex-shrink: 0; max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+.log-line .ls { color: var(--text); word-break: break-all; }
+.log-line .sys { color: var(--text-faint); font-style: italic; }
+
+/* ===== 分页 / 详情抽屉 / toast ===== */
+.pagination { display: flex; gap: 12px; align-items: center; justify-content: flex-end; margin-top: 14px; font-size: 12.5px; color: var(--text-dim); }
+.drawer-mask { position: fixed; inset: 0; background: rgba(4,8,14,.6); backdrop-filter: blur(2px); z-index: 40; display: none; }
+.drawer {
+  position: fixed; top: 0; right: -640px; width: 620px; max-width: 94vw; height: 100vh; z-index: 50;
+  background: var(--bg-panel); border-left: 1px solid var(--border-strong);
+  display: flex; flex-direction: column; transition: right .22s ease;
+}
+.drawer.open { right: 0; }
+.drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.drawer-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+.kv { display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; font-size: 13px; margin-bottom: 18px; }
+.kv .k { color: var(--text-faint); }
+.kv .v { font-family: var(--mono); word-break: break-all; }
+.json-view { font-family: var(--mono); font-size: 12px; background: #070b11; border: 1px solid var(--border); border-radius: 10px; padding: 14px; white-space: pre-wrap; word-break: break-all; color: #9fb3c8; line-height: 1.55; }
+#toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px); z-index: 99;
+  background: var(--bg-raised); border: 1px solid rgba(248,113,113,.5); color: var(--red);
+  padding: 10px 20px; border-radius: 10px; font-size: 13px; transition: transform .25s; max-width: 70vw;
+}
+#toast.show { transform: translateX(-50%) translateY(0); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 99px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ 侧栏 ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#06252c" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6l-8-4z"/>
+        </svg>
+      </div>
+      <div>
+        <div class="name">HIDS</div>
+        <div class="sub">Security Console</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">监控</div>
+      <button data-tab="overview" class="active" onclick="switchTab('overview')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+        概览
+      </button>
+      <button data-tab="live" onclick="switchTab('live')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        实时流
+      </button>
+      <div class="nav-label">调查</div>
+      <button data-tab="events" onclick="switchTab('events')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+        事件检索
+      </button>
+      <button data-tab="alerts" onclick="switchTab('alerts')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        告警中心
+      </button>
+      <button data-tab="hosts" onclick="switchTab('hosts')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/></svg>
+        主机资产
+      </button>
+    </nav>
+    <div class="side-foot">
+      <div class="row"><span>服务状态</span><span><span id="health-dot" class="dot"></span> <span id="health-text">检测中</span></span></div>
+      <div class="row"><span>YAML 规则</span><span id="health-rules">-</span></div>
+      <div class="row"><span>队列容量</span><span id="health-queue">-</span></div>
+    </div>
+  </aside>
+
+  <!-- ============ 主区 ============ -->
+  <div class="main">
+    <div class="topbar">
+      <span class="page-title" id="page-title">概览</span>
+      <span class="spacer"></span>
+      <span class="clock" id="clock"></span>
+      <span class="ws-pill"><span id="ws-dot" class="dot"></span><span id="ws-status">实时流未连接</span></span>
+    </div>
+
+    <div class="content">
+
+      <!-- 概览 -->
+      <section id="overview-panel">
+        <div class="filters">
+          <select id="ov-range" onchange="loadOverview()">
+            <option value="now-1h">近 1 小时</option>
+            <option value="now-24h" selected>近 24 小时</option>
+            <option value="now-7d">近 7 天</option>
+            <option value="">全部时间</option>
+          </select>
+          <button class="btn" onclick="loadOverview()">刷新</button>
+          <label class="check"><input type="checkbox" id="ov-auto" checked> 自动刷新 (30s)</label>
+        </div>
+        <div class="stat-grid">
+          <div class="panel stat">
+            <div class="glow" style="background:var(--accent)"></div>
+            <div class="label">事件总量</div>
+            <div class="value" id="st-events">-</div>
+            <div class="foot" id="st-events-foot">&nbsp;</div>
+          </div>
+          <div class="panel stat">
+            <div class="glow" style="background:var(--red)"></div>
+            <div class="label">威胁告警</div>
+            <div class="value" id="st-alerts" style="color:var(--red)">-</div>
+            <div class="foot" id="st-alerts-foot">&nbsp;</div>
+          </div>
+          <div class="panel stat">
+            <div class="glow" style="background:var(--amber)"></div>
+            <div class="label">高危事件</div>
+            <div class="value" id="st-high" style="color:var(--amber)">-</div>
+            <div class="foot">threat.level = high</div>
+          </div>
+          <div class="panel stat">
+            <div class="glow" style="background:var(--green)"></div>
+            <div class="label">在线主机</div>
+            <div class="value" id="st-hosts" style="color:var(--green)">-</div>
+            <div class="foot">已上报 agent 数</div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">事件类型分布</span></div>
+            <div class="panel-body" id="kind-bars"><div class="empty">加载中…</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">威胁级别分布</span></div>
+            <div class="panel-body" id="level-bars"><div class="empty">加载中…</div></div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title">最近告警</span>
+              <button class="btn sm" onclick="switchTab('alerts')">查看全部 →</button>
+            </div>
+            <div class="panel-body" id="recent-alerts" style="padding:0"><div class="empty">加载中…</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">服务端指标 (/stats)</span></div>
+            <div class="panel-body"><div class="metric-grid" id="server-metrics"><div class="empty">加载中…</div></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 事件检索 -->
+      <section id="events-panel" style="display:none">
+        <div class="filters">
+          <select id="f-kind">
+            <option value="">全部类型</option>
+            <option value="0">Bash</option><option value="2">Flow</option>
+            <option value="3">HTTP</option><option value="4">Exec</option>
+            <option value="5">Exit</option><option value="6">File</option>
+            <option value="7">TLS</option><option value="8">Baseline</option>
+          </select>
+          <select id="f-threat">
+            <option value="">全部级别</option>
+            <option value="high">高危</option><option value="medium">中危</option><option value="low">低危</option>
+          </select>
+          <input type="text" id="f-host" placeholder="Host ID">
+          <input type="text" id="f-ip" placeholder="客户端 IP">
+          <input type="text" id="f-keyword" placeholder="关键字搜索" style="width:220px" onkeydown="if(event.key==='Enter')searchEvents()">
+          <button class="btn primary" onclick="searchEvents()">搜索</button>
+        </div>
+        <div class="table-wrap" style="max-height:calc(100vh - 250px)">
+          <table>
+            <thead><tr><th style="width:170px">时间</th><th style="width:90px">类型</th><th style="width:150px">主机</th><th style="width:90px">威胁</th><th>摘要</th></tr></thead>
+            <tbody id="events-body"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <span id="page-info">-</span>
+          <button class="btn sm" id="prev-btn" onclick="prevPage()" disabled>‹ 上一页</button>
+          <button class="btn sm" id="next-btn" onclick="nextPage()">下一页 ›</button>
+        </div>
+      </section>
+
+      <!-- 告警中心 -->
+      <section id="alerts-panel" style="display:none">
+        <div class="filters">
+          <select id="a-level">
+            <option value="">全部级别</option>
+            <option value="high">高危</option><option value="medium">中危</option><option value="low">低危</option>
+          </select>
+          <input type="text" id="a-host" placeholder="Host ID">
+          <button class="btn primary" onclick="searchAlerts()">搜索</button>
+        </div>
+        <div class="table-wrap" style="max-height:calc(100vh - 210px)">
+          <table>
+            <thead><tr><th style="width:170px">时间</th><th style="width:90px">级别</th><th style="width:90px">类型</th><th style="width:150px">主机</th><th style="width:200px">规则</th><th>摘要</th></tr></thead>
+            <tbody id="alerts-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 主机资产 -->
+      <section id="hosts-panel" style="display:none">
+        <div class="filters"><button class="btn" onclick="loadHosts()">刷新</button></div>
+        <div class="hosts-grid" id="hosts-grid"></div>
+      </section>
+
+      <!-- 实时流 -->
+      <section id="live-panel" style="display:none">
+        <div class="filters">
+          <select id="ws-kind">
+            <option value="">全部类型</option>
+            <option value="0">Bash</option><option value="2">Flow</option>
+            <option value="3">HTTP</option><option value="4">Exec</option>
+            <option value="6">File</option><option value="7">TLS</option>
+            <option value="8">Baseline</option>
+          </select>
+          <input type="text" id="ws-host" placeholder="Host ID">
+          <label class="check"><input type="checkbox" id="ws-alerts"> 仅告警</label>
+          <button class="btn primary" id="ws-btn" onclick="toggleWs()">连接</button>
+          <button class="btn" onclick="clearLiveLog()">清空</button>
+          <label class="check"><input type="checkbox" id="ws-scroll" checked> 自动滚动</label>
+          <span style="font-size:12px;color:var(--text-faint)" id="live-count"></span>
+        </div>
+        <div class="live-log" id="live-log"></div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<!-- 详情抽屉 -->
+<div class="drawer-mask" id="drawer-mask" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="panel-title" id="drawer-title">事件详情</span>
+    <button class="btn sm" onclick="closeDrawer()">关闭 ✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="kv" id="drawer-kv"></div>
+    <div class="panel-title" style="margin-bottom:10px">原始文档</div>
+    <div class="json-view" id="drawer-json"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const API = window.location.origin;
+const PAGE_SIZE = 50;
+const KIND_MAP = {0:'Bash',2:'Flow',3:'HTTP',4:'Exec',5:'Exit',6:'File',7:'TLS',8:'Baseline'};
+const KIND_CLASS = {0:'bash',2:'flow',3:'http',4:'exec',5:'exit',6:'file',7:'tls',8:'baseline'};
+const LEVEL_LABEL = {high:'高危', medium:'中危', low:'低危', none:'—'};
+const TAB_TITLE = {overview:'概览', events:'事件检索', alerts:'告警中心', hosts:'主机资产', live:'实时事件流'};
+
+let currentPage = 0, totalEvents = 0, ws = null, liveCount = 0, ovTimer = null;
+
+/* ---------- 工具 ---------- */
+const $ = id => document.getElementById(id);
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(ts) {
+  if (!ts) return '-';
+  try { return new Date(ts).toLocaleString('zh-CN', {hour12:false}); } catch { return ts; }
+}
+function fmtNum(n) { return (n ?? 0).toLocaleString('en-US'); }
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 3500);
+}
+async function apiGet(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+function kindTag(kind) {
+  return `<span class="tag ${KIND_CLASS[kind] || 'none'}">${esc(KIND_MAP[kind] ?? kind)}</span>`;
+}
+function levelTag(ev) {
+  const lv = (ev.threat && ev.threat.level) || 'none';
+  return `<span class="lvl ${esc(lv)}">${LEVEL_LABEL[lv] || esc(lv)}</span>`;
+}
+function eventSummary(ev) {
+  if (ev.line) return ev.line;
+  if (ev.http_url) return (ev.http_method || '') + ' ' + ev.http_url;
+  if (ev.exec_path) return ev.exec_path + ' ' + (ev.exec_args || []).join(' ');
+  if (ev.file_path) return (ev.file_op || '') + ' ' + ev.file_path;
+  if (ev.baseline_check) return `${ev.baseline_check}: ${ev.baseline_status || ''} ${(ev.baseline_result || '').substring(0, 100)}`;
+  if (ev.tls_sni) return ev.tls_sni + ' ' + (ev.tls_payload_trunc || '').substring(0, 100);
+  if (ev.flow_dst_ip) return `${ev.flow_src_ip}:${ev.flow_src_port} → ${ev.flow_dst_ip}:${ev.flow_dst_port}`;
+  return '-';
+}
+
+/* ---------- 导航 ---------- */
+function switchTab(name) {
+  document.querySelectorAll('.nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  ['overview','events','alerts','hosts','live'].forEach(t => { $(t + '-panel').style.display = (t === name) ? 'block' : 'none'; });
+  $('page-title').textContent = TAB_TITLE[name] || name;
+  if (name === 'overview') loadOverview();
+  if (name === 'events' && !$('events-body').children.length) searchEvents();
+  if (name === 'alerts') searchAlerts();
+  if (name === 'hosts') loadHosts();
+}
+
+/* ---------- 健康 / 时钟 ---------- */
+async function loadHealth() {
+  try {
+    const h = await apiGet('/healthz');
+    $('health-dot').className = 'dot ok';
+    $('health-text').textContent = '正常';
+    $('health-rules').textContent = h.yaml_rules ? '已加载' : '内建';
+    $('health-queue').textContent = fmtNum(h.queue_capacity);
+  } catch {
+    $('health-dot').className = 'dot err';
+    $('health-text').textContent = '不可达';
+  }
+}
+setInterval(loadHealth, 30000);
+setInterval(() => { $('clock').textContent = new Date().toLocaleString('zh-CN', {hour12:false}); }, 1000);
+
+/* ---------- 概览 ---------- */
+async function countEvents(extra) {
+  const params = new URLSearchParams({size: '1'});
+  const range = $('ov-range').value;
+  if (range) params.set('from', range);
+  for (const [k, v] of Object.entries(extra || {})) params.set(k, v);
+  const d = await apiGet('/events/search?' + params);
+  return d.total || 0;
+}
+async function loadOverview() {
+  try {
+    const range = $('ov-range').value;
+    const rangeLabel = $('ov-range').selectedOptions[0].textContent;
+
+    const alertParams = new URLSearchParams({size: '8'});
+    if (range) alertParams.set('from', range);
+
+    const kinds = Object.keys(KIND_MAP);
+    const [total, high, medium, low, alerts, hosts, stats, ...kindCounts] = await Promise.all([
+      countEvents(),
+      countEvents({threat_level: 'high'}),
+      countEvents({threat_level: 'medium'}),
+      countEvents({threat_level: 'low'}),
+      apiGet('/alerts?' + alertParams).catch(() => ({total: 0, events: []})),
+      apiGet('/hosts').catch(() => ({hosts: []})),
+      apiGet('/stats').catch(() => null),
+      ...kinds.map(k => countEvents({event_kind: k})),
+    ]);
+
+    $('st-events').textContent = fmtNum(total);
+    $('st-events-foot').textContent = rangeLabel;
+    $('st-alerts').textContent = fmtNum(alerts.total || 0);
+    $('st-alerts-foot').textContent = rangeLabel;
+    $('st-high').textContent = fmtNum(high);
+    $('st-hosts').textContent = fmtNum((hosts.hosts || []).length);
+
+    // 类型分布
+    const pairs = kinds.map((k, i) => [k, kindCounts[i]]).filter(p => p[1] > 0);
+    const maxK = Math.max(1, ...pairs.map(p => p[1]));
+    $('kind-bars').innerHTML = pairs.length ? pairs.sort((a, b) => b[1] - a[1]).map(([k, n]) => `
+      <div class="bar-row">
+        <span>${kindTag(k)}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${(n / maxK * 100).toFixed(1)}%"></div></div>
+        <span class="n">${fmtNum(n)}</span>
+      </div>`).join('') : '<div class="empty">该时间段暂无事件</div>';
+
+    // 级别分布
+    const lv = [['high', high, 'var(--red)'], ['medium', medium, 'var(--amber)'], ['low', low, 'var(--yellow)']];
+    const maxL = Math.max(1, high, medium, low);
+    $('level-bars').innerHTML = (high + medium + low) ? lv.map(([name, n, color]) => `
+      <div class="bar-row">
+        <span class="lvl ${name}">${LEVEL_LABEL[name]}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${(n / maxL * 100).toFixed(1)}%;background:${color}"></div></div>
+        <span class="n">${fmtNum(n)}</span>
+      </div>`).join('') : '<div class="empty">该时间段无威胁事件 ✓</div>';
+
+    // 最近告警
+    const evs = alerts.events || [];
+    $('recent-alerts').innerHTML = evs.length ? `<table>${evs.map(ev => `
+      <tr onclick='openDrawer(${JSON.stringify(JSON.stringify(ev))})'>
+        <td class="t-time">${fmtTime(ev['@timestamp'])}</td>
+        <td>${levelTag(ev)}</td>
+        <td class="t-sum" style="max-width:260px">${esc(eventSummary(ev))}</td>
+      </tr>`).join('')}</table>` : '<div class="empty">暂无告警</div>';
+
+    // 服务端指标
+    if (stats) {
+      const picks = [
+        ['accepted', '已接收事件'], ['es_flushed_docs', 'ES 已入库'],
+        ['es_alerts_flushed_docs', '告警已入库'], ['es_bulk_requests', 'bulk 请求数'],
+        ['es_bulk_failures', 'bulk 失败'], ['es_bulk_item_errors', '条目错误'],
+        ['es_spooled_batches', 'spool 批次'], ['rejected_queue_full', '队满拒绝'],
+        ['rejected_unauthorized', '鉴权拒绝'], ['rejected_bad_request', '非法请求'],
+        ['dropped_plain_syn_flow', 'SYN 降噪'],
+      ];
+      $('server-metrics').innerHTML = picks
+        .filter(([k]) => stats[k] !== undefined)
+        .map(([k, label]) => `<div class="metric"><span>${label}</span><b>${fmtNum(stats[k])}</b></div>`)
+        .join('') || '<div class="empty">无可用指标</div>';
+    }
+  } catch (e) {
+    toast('概览加载失败: ' + e.message);
+  }
+}
+$('ov-auto').addEventListener('change', setupAutoRefresh);
+function setupAutoRefresh() {
+  clearInterval(ovTimer);
+  if ($('ov-auto').checked) {
+    ovTimer = setInterval(() => {
+      if ($('overview-panel').style.display !== 'none') loadOverview();
+    }, 30000);
+  }
+}
+
+/* ---------- 事件检索 ---------- */
+function searchEvents() { currentPage = 0; loadEvents(); }
+async function loadEvents() {
+  const params = new URLSearchParams({size: PAGE_SIZE, from_offset: currentPage * PAGE_SIZE});
+  const f = {event_kind: $('f-kind').value, host_id: $('f-host').value, keyword: $('f-keyword').value,
+             threat_level: $('f-threat').value, client_ip: $('f-ip').value};
+  for (const [k, v] of Object.entries(f)) if (v) params.set(k, v);
+  try {
+    const data = await apiGet('/events/search?' + params);
+    totalEvents = data.total || 0;
+    renderEvents(data.events || []);
+    updatePagination();
+  } catch (e) {
+    $('events-body').innerHTML = `<tr><td colspan="5" class="empty">查询失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+function renderEvents(events) {
+  const tbody = $('events-body');
+  if (!events.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">暂无数据</td></tr>'; return; }
+  tbody.innerHTML = events.map(ev => `
+    <tr onclick='openDrawer(${JSON.stringify(JSON.stringify(ev))})'>
+      <td class="t-time">${fmtTime(ev['@timestamp'])}</td>
+      <td>${kindTag(ev.event_kind)}</td>
+      <td class="t-host" title="${esc(ev.host_id)}">${esc(ev.host_id || '-')}</td>
+      <td>${levelTag(ev)}</td>
+      <td class="t-sum" title="${esc(eventSummary(ev))}">${esc(eventSummary(ev))}</td>
+    </tr>`).join('');
+}
+function updatePagination() {
+  const totalPages = Math.max(1, Math.ceil(totalEvents / PAGE_SIZE));
+  $('page-info').textContent = totalEvents ? `第 ${currentPage + 1} / ${totalPages} 页 · 共 ${fmtNum(totalEvents)} 条` : '无数据';
+  $('prev-btn').disabled = currentPage <= 0;
+  $('next-btn').disabled = (currentPage + 1) >= totalPages;
+}
+function prevPage() { if (currentPage > 0) { currentPage--; loadEvents(); } }
+function nextPage() { currentPage++; loadEvents(); }
+
+/* ---------- 告警 ---------- */
+async function searchAlerts() {
+  const params = new URLSearchParams({size: '100'});
+  if ($('a-level').value) params.set('level', $('a-level').value);
+  if ($('a-host').value) params.set('host_id', $('a-host').value);
+  try {
+    const data = await apiGet('/alerts?' + params);
+    const evs = data.events || [];
+    $('alerts-body').innerHTML = evs.length ? evs.map(ev => `
+      <tr onclick='openDrawer(${JSON.stringify(JSON.stringify(ev))})'>
+        <td class="t-time">${fmtTime(ev['@timestamp'])}</td>
+        <td>${levelTag(ev)}</td>
+        <td>${kindTag(ev.event_kind)}</td>
+        <td class="t-host" title="${esc(ev.host_id)}">${esc(ev.host_id || '-')}</td>
+        <td style="font-family:var(--mono);font-size:12px">${esc(ev.threat?.rule_id || '-')}</td>
+        <td class="t-sum" title="${esc(eventSummary(ev))}">${esc(eventSummary(ev))}</td>
+      </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无告警</td></tr>';
+  } catch (e) {
+    $('alerts-body').innerHTML = `<tr><td colspan="6" class="empty">查询失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+/* ---------- 主机 ---------- */
+async function loadHosts() {
+  try {
+    const data = await apiGet('/hosts');
+    const hosts = data.hosts || [];
+    $('hosts-grid').innerHTML = hosts.length ? hosts.map(h => `
+      <div class="panel host-card">
+        <div class="hid"><span class="dot ok"></span>${esc(h.host_id)}</div>
+        <div class="meta"><span>事件数</span><b>${fmtNum(h.event_count)}</b></div>
+        <div class="meta"><span>最后上报</span><b>${fmtTime(h.last_seen)}</b></div>
+      </div>`).join('') : '<div class="empty">暂无主机数据</div>';
+  } catch (e) {
+    $('hosts-grid').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+/* ---------- 实时流 ---------- */
+function clearLiveLog() { $('live-log').innerHTML = ''; liveCount = 0; $('live-count').textContent = ''; }
+function toggleWs() {
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); return; }
+  const params = new URLSearchParams();
+  if ($('ws-kind').value) params.set('event_kinds', $('ws-kind').value);
+  if ($('ws-host').value) params.set('host_id', $('ws-host').value);
+  if ($('ws-alerts').checked) params.set('alerts_only', 'true');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/events?${params}`);
+  ws.onopen = () => {
+    $('ws-btn').textContent = '断开';
+    $('ws-btn').classList.remove('primary'); $('ws-btn').classList.add('danger');
+    $('ws-dot').className = 'dot ok'; $('ws-status').textContent = '实时流已连接';
+  };
+  ws.onclose = () => {
+    $('ws-btn').textContent = '连接';
+    $('ws-btn').classList.add('primary'); $('ws-btn').classList.remove('danger');
+    $('ws-dot').className = 'dot'; $('ws-status').textContent = '实时流未连接';
+  };
+  ws.onmessage = e => {
+    const log = $('live-log');
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev._system === 'lagged') {
+        line.innerHTML = `<span class="sys">⚠ 消费滞后，跳过 ${esc(ev.skipped)} 条事件</span>`;
+      } else {
+        const lv = ev.threat?.level;
+        if (lv === 'high') line.classList.add('threat-high');
+        else if (lv === 'medium') line.classList.add('threat-medium');
+        line.innerHTML =
+          `<span class="lt">${fmtTime(ev['@timestamp']).split(' ')[1] || ''}</span>` +
+          kindTag(ev.event_kind) +
+          `<span class="lh" title="${esc(ev.host_id)}">${esc(ev.host_id || '')}</span>` +
+          `<span class="ls">${esc(eventSummary(ev).substring(0, 300))}</span>`;
+        line.onclick = () => openDrawer(JSON.stringify(ev));
+      }
+    } catch { line.textContent = e.data; }
+    log.appendChild(line);
+    liveCount++;
+    $('live-count').textContent = `已接收 ${fmtNum(liveCount)} 条`;
+    while (log.children.length > 500) log.removeChild(log.firstChild);
+    if ($('ws-scroll').checked) log.scrollTop = log.scrollHeight;
+  };
+}
+
+/* ---------- 详情抽屉 ---------- */
+function openDrawer(evJson) {
+  let ev;
+  try { ev = JSON.parse(evJson); } catch { return; }
+  const rows = [
+    ['时间', fmtTime(ev['@timestamp'])],
+    ['类型', KIND_MAP[ev.event_kind] ?? ev.event_kind],
+    ['主机', ev.host_id],
+    ['进程', ev.comm ? `${ev.comm} (pid ${ev.pid ?? '-'})` : null],
+    ['用户 UID', ev.uid],
+    ['威胁级别', ev.threat?.level],
+    ['命中规则', ev.threat?.rule_id],
+    ['威胁评分', ev.threat?.score],
+    ['关联键', ev.correlation_key],
+    ['客户端 IP', ev.client_ip || ev.flow_src_ip],
+    ['SSH 来源', ev.ssh_client_ip],
+  ].filter(([, v]) => v !== undefined && v !== null && v !== '');
+  $('drawer-kv').innerHTML = rows.map(([k, v]) =>
+    `<div class="k">${k}</div><div class="v">${esc(v)}</div>`).join('');
+  $('drawer-title').textContent = `事件详情 · ${KIND_MAP[ev.event_kind] ?? ev.event_kind}`;
+  $('drawer-json').textContent = JSON.stringify(ev, null, 2);
+  $('drawer-mask').style.display = 'block';
+  $('drawer').classList.add('open');
+}
+function closeDrawer() {
+  $('drawer').classList.remove('open');
+  $('drawer-mask').style.display = 'none';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
+/* ---------- 启动 ---------- */
+loadHealth();
+loadOverview();
+setupAutoRefresh();
+$('clock').textContent = new Date().toLocaleString('zh-CN', {hour12:false});
+</script>
+</body>
+</html>
