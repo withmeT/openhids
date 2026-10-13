@@ -75,6 +75,7 @@ flowchart LR
 **服务端**
 - 富化：时间/IP 归一化、跨事件 `correlation_key` 关联键
 - 威胁检测：内建规则 + YAML 热插规则（反弹 shell、下载执行、SQLi、路径穿越）+ SYN 突发统计
+- 多事件关联：时间窗口内同主机行为链升级告警（下载→落地执行、可疑 shell→敏感端口外联、多阶段活动兜底），告警证据带完整触发链
 - 入库：ES `_bulk` 聚批、SipHash 稳定 `_id` 幂等（重试不产生重复）、指数退避、失败 spool 兜底、告警双写
 - 控制面：AES-256-GCM + zstd 加密下发基线核查命令（命令本身密文传输，token 泄漏也无法伪造）
 - 控制台：概览仪表盘、事件检索、告警中心、主机资产、WebSocket 实时流、事件详情抽屉
@@ -149,6 +150,8 @@ curl -s "http://127.0.0.1:8000/events/recent?size=5"
 | [MONITORING.md](MONITORING.md) | 采集架构与数据流说明 |
 | [hids-server-py/README.md](hids-server-py/README.md) | Python 服务端使用说明 |
 | [hids-server-py/docs/INGEST_PIPELINE.md](hids-server-py/docs/INGEST_PIPELINE.md) | FastAPI → ES 入库链路详解 |
+| [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | 兼容性矩阵（仅记录实测组合） |
+| [SECURITY.md](SECURITY.md) | 安全漏洞报告渠道 |
 | [hids-server/docs/ES_FIELDS.md](hids-server/docs/ES_FIELDS.md) | ES 文档字段字典 |
 | [hids-server/docs/INDEX_AND_RETENTION.md](hids-server/docs/INDEX_AND_RETENTION.md) | 索引与保留策略 |
 
@@ -186,7 +189,7 @@ CC=${ARCH}-linux-musl-gcc cargo build --package hids --release \
 - 邮箱：withme00@163.com（技术协作请简要说明你的背景与想法）
 
 ## 许可证
-PF 代码外，hids 以 [MIT 许可证][MIT license] 或
+除 eBPF 代码外，hids 以 [MIT 许可证][MIT license] 或
 [Apache 许可证][Apache license]（2.0 版本）分发，由你任选其一。
 
 所有 eBPF 代码以 [GNU 通用公共许可证第 2 版][GNU General Public License, Version 2]

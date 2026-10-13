@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import io
 import json
+import zlib
 import logging
 import time
 from collections import deque
@@ -64,6 +65,11 @@ class AppState:
         self.syn_tracker = threat.SynBurstTracker(
             cfg.threat_syn_window_sec, cfg.threat_syn_threshold
         )
+        self.correlator: Optional[threat.CorrelationTracker] = (
+            None
+            if cfg.threat_corr_disable
+            else threat.CorrelationTracker(cfg.threat_corr_window_sec)
+        )
         self.ruleset: Optional[threat.Ruleset] = None
         if not cfg.threat_rules_disable and cfg.threat_rules_path is not None:
             try:
@@ -106,7 +112,8 @@ def _decode_ingest_body(body: bytes, content_encoding: Optional[str]) -> dict:
         try:
             decompressor = gzip.GzipFile(fileobj=io.BytesIO(body))
             body = decompressor.read(MAX_DECOMPRESSED_INGEST_BYTES + 1)
-        except OSError as exc:
+        except (OSError, EOFError, zlib.error) as exc:
+            # gzip 坏数据可能抛 BadGzipFile(OSError)/EOFError/zlib.error 三种
             raise ValueError(f"decompress ingest body failed: {exc}") from exc
         if len(body) > MAX_DECOMPRESSED_INGEST_BYTES:
             raise ValueError("decompressed ingest body exceeds limit")
@@ -153,14 +160,24 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 
     @app.get("/stats")
     async def stats():
-        return state.metrics.snapshot()
+        snap = state.metrics.snapshot()
+        # 可观测增强：队列深度与 spool 积压，便于发现"表面正常、实际积压"的情况
+        snap["ingest_queue_depth"] = state.queue.qsize()
+        snap["ingest_queue_capacity"] = cfg.queue_capacity
+        try:
+            snap["spool_backlog_files"] = sum(
+                1 for _ in cfg.spool_dir.glob("bulk-failed-*.ndjson")
+            )
+        except OSError:
+            snap["spool_backlog_files"] = -1
+        return snap
 
     # --- 摄取 ---
 
     def _ingest_one(event: dict, meta: enrich.EnvelopeMeta) -> Optional[JSONResponse]:
         """enrich + threat + 入队 + 广播。队满返回 503。"""
         event = enrich.enrich_event(event, meta)
-        threat.analyze_event(event, state.syn_tracker, state.ruleset)
+        threat.analyze_event(event, state.syn_tracker, state.ruleset, state.correlator)
         try:
             state.queue.put_nowait(event)
         except asyncio.QueueFull:

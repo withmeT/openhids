@@ -46,3 +46,10 @@ __pycache__/
 *~
 .DS_Store
 Thumbs.db
+
+# Local-only dev notes (never publish)
+PROGRESS.md
+demo.md
+test.md
+建议.md
+GRAPH_REPORT.md

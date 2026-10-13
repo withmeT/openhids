@@ -49,6 +49,8 @@ class Config:
     flush_ms: int = 200
     threat_syn_window_sec: int = 1
     threat_syn_threshold: int = 15
+    threat_corr_window_sec: int = 60
+    threat_corr_disable: bool = False
     threat_rules_path: Optional[Path] = field(default_factory=lambda: Path("rules/threat-rules.yaml"))
     threat_rules_disable: bool = False
     flow_drop_plain_syn: bool = False
@@ -91,6 +93,8 @@ class Config:
             flush_ms=_env_int("FLUSH_MS", 200, minimum=1),
             threat_syn_window_sec=_env_int("THREAT_SYN_WINDOW_SEC", 1, minimum=1),
             threat_syn_threshold=_env_int("THREAT_SYN_THRESHOLD", 15, minimum=2),
+            threat_corr_window_sec=_env_int("THREAT_CORR_WINDOW_SEC", 60, minimum=1),
+            threat_corr_disable=_env_bool("THREAT_CORR_DISABLE", False),
             threat_rules_path=rules_path,
             threat_rules_disable=_env_bool("THREAT_RULES_DISABLE", False),
             flow_drop_plain_syn=_env_bool("FLOW_DROP_PLAIN_SYN", False),

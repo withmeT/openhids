@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  agent:
+    name: Agent (Rust workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 默认使用仓库内置的预编译 eBPF 字节码（hids/ebpf/hids.bpf），无需 bpf-linker
+      - name: cargo check
+        run: cargo check
+      - name: cargo test
+        run: cargo test -p hids -p hids-common -p hids-protocol
+
+  server-rust:
+    name: Server (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hids-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hids-server
+      - name: cargo check
+        run: cargo check
+      - name: cargo test
+        run: cargo test
+
+  server-python:
+    name: Server (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hids-server-py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: pytest
+        run: pytest -q

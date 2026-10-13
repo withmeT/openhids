@@ -85,6 +85,175 @@ def _num_i64(event: dict, key: str) -> Optional[int]:
     return value
 
 
+# ---------------------------------------------------------------------------
+# 多事件关联（时间窗口 + 同主机行为链）
+# ---------------------------------------------------------------------------
+
+RE_DOWNLOAD_TOOL = re.compile(r"(?i)\b(curl|wget|tftp|scp)\b")
+_TMP_EXEC_PREFIXES = ("/tmp/", "/dev/shm/", "/var/tmp/")
+
+_CORR_MAX_HOSTS = 4096
+_CORR_MAX_SIGNALS_PER_HOST = 128
+_CORR_MULTI_STAGE_MIN_RULES = 3
+
+
+@dataclass
+class _Signal:
+    ts_ms: int
+    kind: str  # download / tmp_exec / shell_suspicious / hit
+    rule_id: str
+    summary: str
+
+
+class CorrelationTracker:
+    """时间窗口内同主机的多事件关联（可解释的确定性行为链）。
+
+    单个事件各自看可能只是低危信号；在窗口内构成行为链时升级告警：
+
+    - ``corr_download_then_tmp_exec``（high）：下载工具出现后，同主机从
+      /tmp、/dev/shm、/var/tmp 执行程序 —— 典型"下载落地执行"链。
+    - ``corr_shell_then_sensitive_port``（medium）：可疑 shell 命令后，
+      同主机出现敏感端口网络活动。
+    - ``corr_multi_stage_activity``（medium）：窗口内同主机累计命中
+      ≥3 条不同规则 —— 多阶段可疑活动兜底。
+
+    每条关联告警的 evidence 附带触发链（时间 + 信号 + 摘要），可直接解释
+    "为什么产生该告警"。同一主机同一关联规则在窗口内只触发一次。
+    """
+
+    def __init__(self, window_sec: int = 60, max_hosts: int = _CORR_MAX_HOSTS) -> None:
+        self._window_ms = max(window_sec, 1) * 1000
+        self._max_hosts = max_hosts
+        self._signals: dict[str, list[_Signal]] = {}
+        self._last_fired: dict[tuple[str, str], int] = {}
+
+    # -- 信号提取 -----------------------------------------------------------
+
+    @staticmethod
+    def _event_summary(event: dict) -> str:
+        for key in ("line", "exec_path", "http_url", "flow_dst_ip"):
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                return value[:80]
+        return ""
+
+    def _extract_signals(self, event: dict, hits: list[RuleHit], ts_ms: int) -> list[_Signal]:
+        signals: list[_Signal] = []
+        kind = _num_i64(event, "event_kind")
+        summary = self._event_summary(event)
+
+        if kind == 0:
+            line = _str_field(event, "line") or ""
+            if RE_DOWNLOAD_TOOL.search(line):
+                signals.append(_Signal(ts_ms, "download", "", summary))
+        if kind == 4:
+            path = _str_field(event, "exec_path") or ""
+            args = event.get("exec_args")
+            arg_text = " ".join(a for a in args if isinstance(a, str)) if isinstance(args, list) else ""
+            if RE_DOWNLOAD_TOOL.search(path) or RE_DOWNLOAD_TOOL.search(arg_text):
+                signals.append(_Signal(ts_ms, "download", "", summary))
+            if path.startswith(_TMP_EXEC_PREFIXES):
+                signals.append(_Signal(ts_ms, "tmp_exec", "", summary))
+        for hit in hits:
+            if hit.id == "shell_suspicious_pattern":
+                signals.append(_Signal(ts_ms, "shell_suspicious", hit.id, summary))
+            signals.append(_Signal(ts_ms, "hit", hit.id, summary))
+        return signals
+
+    # -- 主入口 -------------------------------------------------------------
+
+    def observe(self, event: dict, hits: list[RuleHit]) -> list[RuleHit]:
+        """记录本事件信号，返回新形成的关联告警（可能为空）。"""
+        if not isinstance(event, dict):
+            return []
+        host = _str_field(event, "host_id") or "unknown_host"
+        ts_ms = _num_i64(event, "ts_ms")
+        if ts_ms is None or ts_ms <= 0:
+            return []
+
+        window = self._signals.setdefault(host, [])
+        # 窗口内裁剪 + 容量上限
+        cutoff = ts_ms - self._window_ms
+        window[:] = [s for s in window if s.ts_ms >= cutoff][-_CORR_MAX_SIGNALS_PER_HOST:]
+        if len(self._signals) > self._max_hosts:
+            oldest = min(self._signals, key=lambda h: self._signals[h][-1].ts_ms if self._signals[h] else 0)
+            if oldest != host:
+                del self._signals[oldest]
+
+        new_signals = self._extract_signals(event, hits, ts_ms)
+        corr_hits: list[RuleHit] = []
+
+        kind = _num_i64(event, "event_kind")
+
+        # 链 1：下载 → tmp 目录执行
+        if any(s.kind == "tmp_exec" for s in new_signals):
+            prior = [s for s in window if s.kind == "download"]
+            if prior and self._arm(host, "corr_download_then_tmp_exec", ts_ms):
+                corr_hits.append(self._make_hit(
+                    "corr_download_then_tmp_exec", "high", "correlation",
+                    prior[-1], ts_ms, self._event_summary(event),
+                ))
+
+        # 链 2：可疑 shell → 敏感端口网络活动
+        if kind == 2 and _num_i64(event, "flow_dst_port") in _SENSITIVE_PORTS:
+            prior = [s for s in window if s.kind == "shell_suspicious"]
+            if prior and self._arm(host, "corr_shell_then_sensitive_port", ts_ms):
+                corr_hits.append(self._make_hit(
+                    "corr_shell_then_sensitive_port", "medium", "correlation",
+                    prior[-1], ts_ms, self._event_summary(event),
+                ))
+
+        # 链 3：窗口内 ≥N 条不同规则命中（多阶段活动兜底）
+        distinct = {s.rule_id for s in window if s.kind == "hit"}
+        distinct |= {h.id for h in hits}
+        if len(distinct) >= _CORR_MULTI_STAGE_MIN_RULES and self._arm(
+            host, "corr_multi_stage_activity", ts_ms
+        ):
+            corr_hits.append(RuleHit(
+                id="corr_multi_stage_activity",
+                severity="medium",
+                category="correlation",
+                evidence={
+                    "window_ms": self._window_ms,
+                    "distinct_rules": sorted(distinct),
+                },
+            ))
+
+        window.extend(new_signals)
+        return corr_hits
+
+    # -- 内部 ---------------------------------------------------------------
+
+    def _arm(self, host: str, rule_id: str, ts_ms: int) -> bool:
+        """同主机同关联规则在窗口内只触发一次。"""
+        key = (host, rule_id)
+        last = self._last_fired.get(key)
+        if last is not None and ts_ms - last < self._window_ms:
+            return False
+        if len(self._last_fired) > self._max_hosts * 4:
+            self._last_fired.clear()
+        self._last_fired[key] = ts_ms
+        return True
+
+    @staticmethod
+    def _make_hit(
+        rule_id: str, severity: str, category: str,
+        trigger: _Signal, ts_ms: int, current_summary: str,
+    ) -> RuleHit:
+        return RuleHit(
+            id=rule_id,
+            severity=severity,
+            category=category,
+            evidence={
+                "chain": [
+                    {"ts_ms": trigger.ts_ms, "signal": trigger.kind, "summary": trigger.summary},
+                    {"ts_ms": ts_ms, "signal": "current_event", "summary": current_summary},
+                ],
+                "gap_ms": ts_ms - trigger.ts_ms,
+            },
+        )
+
+
 def collect_builtin_hits(
     root: Any, syn_tracker: SynBurstTracker
 ) -> tuple[list[RuleHit], ThreatContext]:
@@ -291,14 +460,22 @@ def analyze_event(
     event: dict,
     syn_tracker: SynBurstTracker,
     ruleset: Optional[Ruleset],
+    correlator: Optional[CorrelationTracker] = None,
 ) -> None:
-    """跑探测器并把 ``threat`` 对象合并进文档根，与 Rust ``analyze_event`` 一致。"""
+    """跑探测器并把 ``threat`` 对象合并进文档根，与 Rust ``analyze_event`` 一致。
+
+    传入 ``correlator`` 时追加时间窗口多事件关联（关联命中与普通规则
+    一样进入 ``threat.rules``，evidence 带行为链）。
+    """
     if ruleset is not None:
         hits, ctx = ruleset.analyze(event, syn_tracker)
         model_version = ruleset.version
     else:
         hits, ctx = collect_builtin_hits(event, syn_tracker)
         model_version = THREAT_MODEL_VERSION
+
+    if correlator is not None:
+        hits.extend(correlator.observe(event, hits))
 
     score = min(sum(_severity_weight(h.severity) for h in hits), 100)
     categories = sorted({h.category for h in hits})
